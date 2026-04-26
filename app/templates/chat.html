@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ITS Chat</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/marked@13/marked.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js" defer></script>
+    <script src="{{ url_for('static', path='/chat.js') }}" defer></script>
+  </head>
+  <body data-page="chat">
+    <a class="skip-link" href="#chat-input">Skip to message input</a>
+
+    <header class="topbar" aria-label="Primary">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">IT</span>
+        <div>
+          <p class="eyebrow">Helpdesk Assistant</p>
+          <h1>ITS Support Chat</h1>
+        </div>
+      </div>
+      <nav class="topbar-actions" aria-label="Page links">
+        <a class="button button-secondary" href="/admin">Admin</a>
+        <form action="/auth/logout" method="post" style="display:inline">
+          <button type="submit" class="button button-ghost">Sign out</button>
+        </form>
+      </nav>
+    </header>
+
+    <main class="chat-shell">
+      <section class="chat-workspace" aria-label="Support conversation">
+        <div class="chat-header">
+          <div>
+            <p class="eyebrow">Live intake</p>
+            <h2>Describe the issue</h2>
+          </div>
+          <div class="status-pill" id="chat-status" role="status" aria-live="polite">
+            Ready
+          </div>
+        </div>
+
+        <div class="message-list" id="message-list" aria-live="polite" aria-label="Conversation">
+          <article class="message message-assistant">
+            <div class="message-avatar" aria-hidden="true">A</div>
+            <div class="message-body">
+              <p class="message-meta">Assistant</p>
+              <p>
+                Tell me what is broken, who is affected, and any error text you see. I can
+                troubleshoot first or prepare a ticket when escalation is needed.
+              </p>
+            </div>
+          </article>
+        </div>
+
+        <form class="chat-composer" id="chat-form">
+          <label class="sr-only" for="chat-input">Message</label>
+          <textarea
+            id="chat-input"
+            name="message"
+            rows="3"
+            placeholder="Example: VPN connects but internal sites time out after MFA..."
+            required
+          ></textarea>
+          <button class="button button-primary" id="send-button" type="submit">
+            Send
+          </button>
+        </form>
+      </section>
+
+      <aside class="context-panel" aria-label="Session context">
+        <section class="panel-section">
+          <p class="eyebrow">Ticket status</p>
+          <h2 id="ticket-title">No ticket opened</h2>
+          <dl class="detail-list">
+            <div>
+              <dt>Ticket ID</dt>
+              <dd id="ticket-id">Pending</dd>
+            </div>
+            <div>
+              <dt>Priority</dt>
+              <dd id="ticket-priority">Unassigned</dd>
+            </div>
+            <div>
+              <dt>Category</dt>
+              <dd id="ticket-category">Unclassified</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="panel-section">
+          <p class="eyebrow">Suggested details</p>
+          <ul class="check-list">
+            <li>Device, app, or service name</li>
+            <li>Business impact and affected users</li>
+            <li>Error message or recent change</li>
+            <li>Steps already attempted</li>
+          </ul>
+        </section>
+
+        <section class="panel-section">
+          <p class="eyebrow">Knowledge matches</p>
+          <div class="citation-list" id="citation-list">
+            <p class="muted">References from the assistant will appear here.</p>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </body>
+</html>

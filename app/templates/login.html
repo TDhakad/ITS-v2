@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in — ITS Helpdesk</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+    <style>
+      /* Login-page scoped styles */
+      .login-shell {
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem 1rem;
+        background: var(--bg, #f8fafc);
+      }
+
+      .login-card {
+        width: 100%;
+        max-width: 400px;
+        background: var(--surface, #fff);
+        border: 1px solid var(--border, #e2e8f0);
+        border-radius: 12px;
+        padding: 2.5rem 2rem;
+        box-shadow: 0 4px 24px rgba(0,0,0,.06);
+      }
+
+      .login-header {
+        margin-bottom: 2rem;
+      }
+
+      .login-header .brand-mark {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        height: 40px;
+        background: var(--accent, #2563eb);
+        color: #fff;
+        font-weight: 700;
+        font-size: .875rem;
+        border-radius: 8px;
+        margin-bottom: .75rem;
+      }
+
+      .login-header h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0 0 .25rem;
+      }
+
+      .login-header p {
+        font-size: .875rem;
+        color: var(--muted, #64748b);
+        margin: 0;
+      }
+
+      .login-form .field {
+        margin-bottom: 1.25rem;
+      }
+
+      .login-form label {
+        display: block;
+        font-size: .8125rem;
+        font-weight: 500;
+        margin-bottom: .375rem;
+        color: var(--text, #0f172a);
+      }
+
+      .login-form input[type="email"],
+      .login-form input[type="password"] {
+        width: 100%;
+        padding: .625rem .75rem;
+        border: 1px solid var(--border, #e2e8f0);
+        border-radius: 8px;
+        font-size: .9375rem;
+        background: var(--bg, #f8fafc);
+        color: var(--text, #0f172a);
+        transition: border-color .15s, box-shadow .15s;
+        box-sizing: border-box;
+      }
+
+      .login-form input:focus {
+        outline: none;
+        border-color: var(--accent, #2563eb);
+        box-shadow: 0 0 0 3px rgba(37,99,235,.15);
+      }
+
+      .login-submit {
+        width: 100%;
+        padding: .6875rem 1rem;
+        font-size: .9375rem;
+        font-weight: 600;
+        border: none;
+        border-radius: 8px;
+        background: var(--accent, #2563eb);
+        color: #fff;
+        cursor: pointer;
+        transition: background .15s, transform .1s;
+        margin-top: .25rem;
+      }
+
+      .login-submit:hover  { background: #1d4ed8; }
+      .login-submit:active { transform: scale(.99); }
+
+      .login-error {
+        display: none;
+        margin-top: 1rem;
+        padding: .75rem 1rem;
+        border-radius: 8px;
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        color: #991b1b;
+        font-size: .875rem;
+      }
+
+      .login-error.visible { display: block; }
+
+      .login-footer {
+        margin-top: 1.5rem;
+        text-align: center;
+        font-size: .8125rem;
+        color: var(--muted, #64748b);
+      }
+
+      .login-footer a {
+        color: var(--accent, #2563eb);
+        text-decoration: none;
+        font-weight: 500;
+      }
+
+      .login-footer a:hover { text-decoration: underline; }
+    </style>
+  </head>
+  <body>
+    <div class="login-shell">
+      <div class="login-card">
+        <div class="login-header">
+          <span class="brand-mark" aria-hidden="true">IT</span>
+          <h1>ITS Helpdesk</h1>
+          <p>Sign in to your account to continue.</p>
+        </div>
+
+        <form class="login-form" id="login-form" novalidate>
+          <div class="field">
+            <label for="email">Email address</label>
+            <input id="email" name="email" type="email" autocomplete="email"
+                   placeholder="you@example.com" required>
+          </div>
+          <div class="field">
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password"
+                   autocomplete="current-password" placeholder="••••••••" required>
+          </div>
+          <button type="submit" class="login-submit">Sign in</button>
+          <div class="login-error" id="login-error" role="alert" aria-live="assertive"></div>
+        </form>
+
+        <div class="login-footer">
+          Don't have an account?
+          <a href="/register">Request access</a>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const form = document.getElementById('login-form');
+        const errorBox = document.getElementById('login-error');
+
+        function showError(msg) {
+          errorBox.textContent = msg;
+          errorBox.classList.add('visible');
+        }
+
+        function clearError() {
+          errorBox.textContent = '';
+          errorBox.classList.remove('visible');
+        }
+
+        form.addEventListener('submit', async function (e) {
+          e.preventDefault();
+          clearError();
+          const email = document.getElementById('email').value.trim();
+          const password = document.getElementById('password').value;
+          if (!email || !password) {
+            showError('Please enter your email and password.');
+            return;
+          }
+          try {
+            const res = await fetch('/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password }),
+              credentials: 'same-origin',
+            });
+            if (res.ok) {
+              window.location.href = '/';
+            } else {
+              const data = await res.json().catch(() => ({}));
+              showError(data.detail || 'Invalid email or password.');
+            }
+          } catch (err) {
+            showError('Unable to connect. Please try again.');
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

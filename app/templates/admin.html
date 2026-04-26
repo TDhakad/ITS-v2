@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ITS Admin</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+    <script src="{{ url_for('static', path='/admin.js') }}" defer></script>
+  </head>
+  <body data-page="admin">
+    <a class="skip-link" href="#ticket-list">Skip to ticket list</a>
+
+    <header class="topbar" aria-label="Primary">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">IT</span>
+        <div>
+          <p class="eyebrow">Operations console</p>
+          <h1>ITS Admin Dashboard</h1>
+        </div>
+      </div>
+      <nav class="topbar-actions" aria-label="Page links">
+        <a class="button button-secondary" href="/">Chat</a>
+        <button class="button button-primary" id="refresh-button" type="button">Refresh</button>
+      </nav>
+    </header>
+
+    <main class="admin-shell">
+      <section class="ticket-column" aria-label="Tickets">
+        <div class="dashboard-toolbar">
+          <div>
+            <p class="eyebrow">Queue</p>
+            <h2>Tickets</h2>
+          </div>
+          <div class="queue-count" id="queue-count" aria-live="polite">0 open</div>
+        </div>
+
+        <form class="filter-bar" id="ticket-filters">
+          <label>
+            <span>Search</span>
+            <input id="ticket-search" name="search" type="search" autocomplete="off" placeholder="Requester, title, id">
+          </label>
+          <label>
+            <span>Status</span>
+            <select id="status-filter" name="status">
+              <option value="">All</option>
+              <option value="open">Open</option>
+              <option value="triage">Triage</option>
+              <option value="in_progress">In progress</option>
+              <option value="resolved">Resolved</option>
+              <option value="closed">Closed</option>
+            </select>
+          </label>
+          <label>
+            <span>Priority</span>
+            <select id="priority-filter" name="priority">
+              <option value="">All</option>
+              <option value="critical">Critical</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </label>
+        </form>
+
+        <div class="ticket-list" id="ticket-list" tabindex="-1" aria-live="polite">
+          <div class="empty-state">Loading tickets...</div>
+        </div>
+      </section>
+
+      <section class="detail-column" aria-label="Ticket details">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Selected ticket</p>
+            <h2 id="detail-title">Choose a ticket</h2>
+          </div>
+          <span class="status-pill" id="detail-status">No selection</span>
+        </div>
+
+        <dl class="detail-grid">
+          <div>
+            <dt>Requester</dt>
+            <dd id="detail-requester">-</dd>
+          </div>
+          <div>
+            <dt>Priority</dt>
+            <dd id="detail-priority">-</dd>
+          </div>
+          <div>
+            <dt>Category</dt>
+            <dd id="detail-category">-</dd>
+          </div>
+          <div>
+            <dt>Updated</dt>
+            <dd id="detail-updated">-</dd>
+          </div>
+        </dl>
+
+        <div class="detail-block">
+          <h3>Description</h3>
+          <p id="detail-description" class="preserve-lines">Select a queue item to view the ticket record.</p>
+        </div>
+
+        <div class="detail-block">
+          <h3>Conversation</h3>
+          <div class="timeline" id="detail-timeline">
+            <p class="muted">Messages and notes will appear after selection.</p>
+          </div>
+        </div>
+      </section>
+
+      <aside class="insights-column" aria-label="AI insights">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">AI Insights</p>
+            <h2>Guidance</h2>
+          </div>
+          <span class="status-dot" id="insights-status" aria-label="Insights idle"></span>
+        </div>
+
+        <section class="insight-block">
+          <h3>Summary</h3>
+          <p id="insight-summary">Select a ticket to load the generated summary.</p>
+        </section>
+
+        <section class="insight-block">
+          <h3>Recommended action</h3>
+          <p id="insight-action">-</p>
+        </section>
+
+        <section class="insight-block">
+          <h3>Signals</h3>
+          <ul class="tag-list" id="insight-signals">
+            <li>No signals loaded</li>
+          </ul>
+        </section>
+
+        <section class="insight-block">
+          <h3>Knowledge references</h3>
+          <div class="citation-list" id="insight-citations">
+            <p class="muted">No references loaded.</p>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </body>
+</html>
