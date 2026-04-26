@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any
+import logging
+from typing import Annotated, Any
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
@@ -9,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.auth import (
@@ -24,7 +26,6 @@ from app.auth import (
 from app.db import (
     add_project_member,
     create_project,
-    create_ticket as persist_ticket,
     find_duplicate_candidates,
     get_session,
     get_ticket,
@@ -32,7 +33,9 @@ from app.db import (
     list_projects,
     list_tags,
     list_tickets,
-    seed_default_tags,
+)
+from app.db import (
+    create_ticket as persist_ticket,
 )
 from app.schemas import (
     Environment,
@@ -52,6 +55,11 @@ from app.schemas import (
 )
 from app.settings import get_settings
 
+AdminRole = require_role(UserRole.ADMIN)
+AdminUser = Annotated[UserRead, Depends(AdminRole)]
+CurrentUser = Annotated[UserRead, Depends(get_current_user)]
+OptionalUser = Annotated[UserRead | None, Depends(get_optional_user)]
+DBSession = Annotated[Session, Depends(get_session)]
 
 app = FastAPI(
     title="Capstone ITS v2",
@@ -63,6 +71,7 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 _db_initialized = False
+logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
@@ -104,6 +113,10 @@ class AdminResetPasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class AdminAnalyticsRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1_000)
+
+
 class TicketCreateRequest(BaseModel):
     description: str = Field(min_length=1, max_length=8000)
     user_id: str = Field(default="anonymous", min_length=1, max_length=120)
@@ -128,14 +141,14 @@ def startup() -> None:
 
 @app.get("/openapi.json", include_in_schema=False)
 def openapi_schema(
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    _: AdminUser,
 ) -> JSONResponse:
     return JSONResponse(app.openapi())
 
 
 @app.get("/docs", include_in_schema=False, response_class=HTMLResponse)
 def swagger_ui(
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    _: AdminUser,
 ) -> HTMLResponse:
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
@@ -164,7 +177,7 @@ def register_page(request: Request) -> HTMLResponse:
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(
     request: Request,
-    current_user: UserRead = Depends(require_role(UserRole.ADMIN)),
+    current_user: AdminUser,
 ) -> HTMLResponse:
     return templates.TemplateResponse(request, "admin.html")
 
@@ -178,8 +191,8 @@ def health() -> dict[str, str]:
 def chat_turn(
     payload: ChatRequest,
     request: Request,
-    db: Session = Depends(get_session),
-    current_user: UserRead | None = Depends(get_optional_user),
+    db: DBSession,
+    current_user: OptionalUser,
 ) -> dict[str, Any]:
     _ensure_db()
     settings = get_settings()
@@ -216,12 +229,11 @@ def chat_turn(
                 project_id=payload.project_id,
             )
     except Exception as exc:
-        detail = (
-            "Chat backend unavailable. Confirm OPENAI_API_KEY, vector store/RAG dependencies, "
-            f"and app.graph initialization. Original error: {exc}"
-        )
-        print(detail)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail) from exc
+        logger.exception("Chat backend unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat backend unavailable. Check server logs for initialization details.",
+        ) from exc
 
     ticket_id = _result_value(result, "ticket_id")
     ticket = _safe_get_ticket(db, ticket_id) if ticket_id else None
@@ -251,7 +263,7 @@ def chat_turn(
 @app.post("/api/tickets", status_code=status.HTTP_201_CREATED)
 def create_ticket(
     payload: TicketCreateRequest,
-    db: Session = Depends(get_session),
+    db: DBSession,
 ) -> dict[str, Any]:
     _ensure_db()
     try:
@@ -280,49 +292,53 @@ def create_ticket(
         return {"ticket": ticket_to_api(ticket, include_conversation=True)}
     except Exception as exc:
         db.rollback()
-        detail = f"Ticket persistence unavailable or not initialized. Original error: {exc}"
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail) from exc
+        logger.exception("Ticket persistence failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket persistence unavailable.",
+        ) from exc
 
 
 @app.get("/api/tickets")
 def tickets(
+    db: DBSession,
     status_filter: str | None = Query(default=None, alias="status"),
     user_id: str | None = None,
     project_id: int | None = Query(default=None),
     tag_slug: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    db: Session = Depends(get_session),
 ) -> dict[str, list[dict[str, Any]]]:
     _ensure_db()
     parsed_status = _parse_status(status_filter)
     try:
-        found = list_tickets(db, parsed_status, project_id=project_id,
-                             tag_slug=tag_slug, limit=limit)
-        payload = [ticket_to_api(ticket) for ticket in found]
-    except Exception:
-        payload = [
-            _record_to_api(record)
-            for record in _list_ticket_records(db, parsed_status, limit)
-        ]
-    if user_id is not None:
-        payload = [ticket for ticket in payload if ticket.get("user_id") == user_id]
-    return {"tickets": payload}
+        found = list_tickets(
+            db,
+            parsed_status,
+            project_id=project_id,
+            tag_slug=tag_slug,
+            user_id=user_id,
+            limit=limit,
+        )
+    except SQLAlchemyError as exc:
+        logger.exception("Ticket listing failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket listing unavailable.",
+        ) from exc
+    return {"tickets": [ticket_to_api(ticket) for ticket in found]}
 
 
 @app.get("/api/tickets/{ticket_id}")
-def ticket_detail(ticket_id: int, db: Session = Depends(get_session)) -> dict[str, Any]:
+def ticket_detail(ticket_id: int, db: DBSession) -> dict[str, Any]:
     _ensure_db()
     ticket = _safe_get_ticket(db, ticket_id)
     if not ticket:
-        record = _get_ticket_record(db, ticket_id)
-        if record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
-        return _record_to_api(record, include_conversation=True)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
     return ticket_to_api(ticket, include_conversation=True)
 
 
 @app.get("/api/tickets/{ticket_id}/insights")
-def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[str, Any]:
+def ticket_insights(ticket_id: int, db: DBSession) -> dict[str, Any]:
     _ensure_db()
     ticket = _safe_get_ticket(db, ticket_id)
     if not ticket:
@@ -336,11 +352,12 @@ def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[
     )
     kb_refs = list(ticket.resolution.linked_kb_articles)
     suggested_fixes = list(ticket.resolution.suggested_fixes)
+    retrieval_available = True
 
     try:
         rag_module = importlib.import_module("app.rag")
-        rag_class = getattr(rag_module, "HybridRAGPipeline")
-        context_factory = getattr(rag_module, "context_from_user")
+        rag_class = rag_module.HybridRAGPipeline
+        context_factory = rag_module.context_from_user
         rag = rag_class()
         context = context_factory(
             category=ticket.intelligence.category,
@@ -351,6 +368,8 @@ def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[
         docs = rag.retrieve(ticket.intelligence.summary, context, k=5)
         kb_refs = rag.article_refs(docs) or kb_refs
     except Exception:
+        logger.exception("Ticket insight knowledge retrieval failed")
+        retrieval_available = False
         docs = []
 
     if not suggested_fixes:
@@ -374,16 +393,17 @@ def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[
         "duplicates": duplicates,
         "suggested_fixes": suggested_fixes,
         "retrieved_chunks": len(docs),
+        "retrieval_available": retrieval_available,
     }
 
 
 @app.get("/api/admin/insights")
 def admin_insights(
-    db: Session = Depends(get_session),
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    db: DBSession,
+    _: AdminUser,
 ) -> dict[str, Any]:
     _ensure_db()
-    graph_error: str | None = None
+    graph_available = True
     try:
         graph = importlib.import_module("app.graph")
         insights_func = getattr(graph, "admin_insights", None) or getattr(
@@ -393,13 +413,18 @@ def admin_insights(
         )
         if callable(insights_func):
             return {"available": True, "source": "app.graph", "data": insights_func()}
-    except Exception as exc:
-        graph_error = str(exc)
+    except Exception:
+        graph_available = False
+        logger.exception("Graph admin insights unavailable; using database aggregate")
 
     try:
         ticket_payload = [ticket_to_api(ticket) for ticket in list_tickets(db, None, limit=500)]
-    except Exception:
-        ticket_payload = [_record_to_api(record) for record in _list_ticket_records(db, None, 500)]
+    except SQLAlchemyError as exc:
+        logger.exception("Admin insight ticket aggregate failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin insights unavailable.",
+        ) from exc
 
     by_status = _count_by(ticket_payload, "status")
     by_priority = _count_by(ticket_payload, "priority")
@@ -407,7 +432,7 @@ def admin_insights(
     return {
         "available": True,
         "source": "app.db",
-        "graph_error": graph_error,
+        "graph_available": graph_available,
         "data": {
             "total_tickets": len(ticket_payload),
             "by_status": by_status,
@@ -417,12 +442,31 @@ def admin_insights(
     }
 
 
+@app.post("/api/admin/analytics")
+def admin_analytics(
+    payload: AdminAnalyticsRequest,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    try:
+        from app.admin_analytics import run_admin_analytics_question
+
+        result = run_admin_analytics_question(payload.question)
+    except Exception as exc:
+        logger.exception("Admin analytics failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin analytics unavailable.",
+        ) from exc
+    return {"question": payload.question, **result}
+
+
 # ── Auth routes ──────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def auth_register(
     payload: RegisterRequest,
-    db: Session = Depends(get_session),
+    db: DBSession,
 ) -> UserRead:
     _ensure_db()
     return register(db, payload.email, payload.display_name, payload.password)
@@ -433,7 +477,7 @@ def auth_login(
     payload: LoginRequest,
     request: Request,
     response: Response,
-    db: Session = Depends(get_session),
+    db: DBSession,
 ) -> UserRead:
     _ensure_db()
     user_agent = request.headers.get("user-agent", "")
@@ -453,7 +497,7 @@ def auth_login(
 
 @app.post("/auth/logout")
 def auth_logout(
-    db: Session = Depends(get_session),
+    db: DBSession,
     session_token: str | None = Cookie(default=None),
 ) -> RedirectResponse:
     if session_token:
@@ -470,15 +514,15 @@ def auth_login_redirect() -> RedirectResponse:
 
 
 @app.get("/auth/me")
-def auth_me(current_user: UserRead = Depends(get_current_user)) -> UserRead:
+def auth_me(current_user: CurrentUser) -> UserRead:
     return current_user
 
 
 @app.post("/auth/change-password", status_code=status.HTTP_204_NO_CONTENT)
 def auth_change_password(
     payload: ChangePasswordRequest,
-    db: Session = Depends(get_session),
-    current_user: UserRead = Depends(get_current_user),
+    db: DBSession,
+    current_user: CurrentUser,
 ) -> None:
     change_password(db, current_user.id, payload.current_password, payload.new_password)
 
@@ -486,8 +530,8 @@ def auth_change_password(
 @app.post("/auth/reset-password", status_code=status.HTTP_204_NO_CONTENT)
 def auth_reset_password(
     payload: AdminResetPasswordRequest,
-    db: Session = Depends(get_session),
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    db: DBSession,
+    _: AdminUser,
 ) -> None:
     admin_reset_password(db, payload.email, payload.new_password)
 
@@ -496,8 +540,8 @@ def auth_reset_password(
 
 @app.get("/api/projects")
 def get_projects(
-    db: Session = Depends(get_session),
-    _: UserRead = Depends(get_current_user),
+    db: DBSession,
+    _: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
     records = list_projects(db)
@@ -511,8 +555,8 @@ def get_projects(
 @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
 def post_project(
     payload: ProjectCreateRequest,
-    db: Session = Depends(get_session),
-    current_user: UserRead = Depends(get_current_user),
+    db: DBSession,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
     record = create_project(db, ProjectCreate(
@@ -528,7 +572,7 @@ def post_project(
 # ── Tag routes ────────────────────────────────────────────────────────────────
 
 @app.get("/api/tags")
-def get_tags(db: Session = Depends(get_session)) -> dict[str, Any]:
+def get_tags(db: DBSession) -> dict[str, Any]:
     _ensure_db()
     tags = list_tags(db)
     return {"tags": [{"id": t.id, "name": t.name, "slug": t.slug, "color": t.color}
@@ -552,91 +596,10 @@ def _ensure_db() -> None:
 
 def _safe_get_ticket(db: Session, ticket_id: Any) -> TicketRead | None:
     try:
-        return get_ticket(db, int(ticket_id))
-    except Exception:
+        parsed_ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
         return None
-
-
-def _ticket_record_model() -> Any:
-    try:
-        return getattr(importlib.import_module("app.db"), "TicketRecord", None)
-    except Exception:
-        return None
-
-
-def _list_ticket_records(
-    db: Session,
-    parsed_status: TicketStatus | None,
-    limit: int,
-) -> list[Any]:
-    model = _ticket_record_model()
-    if model is None:
-        return []
-    query = db.query(model)
-    if parsed_status is not None and hasattr(model, "status"):
-        query = query.filter(getattr(model, "status") == parsed_status.value)
-    if hasattr(model, "created_at"):
-        query = query.order_by(getattr(model, "created_at").desc())
-    return query.limit(limit).all()
-
-
-def _get_ticket_record(db: Session, ticket_id: int) -> Any | None:
-    model = _ticket_record_model()
-    if model is None:
-        return None
-    return db.get(model, ticket_id)
-
-
-def _record_to_api(record: Any, include_conversation: bool = False) -> dict[str, Any]:
-    intelligence = getattr(record, "intelligence", None) or {}
-    resolution = getattr(record, "resolution", None) or {}
-    summary = (
-        getattr(record, "summary", None)
-        or intelligence.get("summary")
-        or "IT support request"
-    )
-    priority = (
-        getattr(record, "suggested_priority", None)
-        or intelligence.get("suggested_priority")
-        or "Medium"
-    )
-    category = getattr(record, "category", None) or intelligence.get("category") or "Infra"
-    created_at = getattr(record, "created_at", None)
-    updated_at = getattr(record, "updated_at", None)
-    payload: dict[str, Any] = {
-        "id": record.id,
-        "ticket_id": record.id,
-        "title": summary[:96],
-        "summary": summary,
-        "description": summary,
-        "requester": getattr(record, "user_id", None),
-        "created_by": getattr(record, "user_id", None),
-        "user_id": getattr(record, "user_id", None),
-        "thread_id": getattr(record, "thread_id", None),
-        "status": _status_text_to_api(getattr(record, "status", "")),
-        "state": _status_text_to_api(getattr(record, "status", "")),
-        "priority": str(priority).lower(),
-        "severity": str(priority).lower(),
-        "category": category,
-        "type": category,
-        "keywords": getattr(record, "keywords", None) or intelligence.get("keywords", []),
-        "app_name": getattr(record, "app_name", None),
-        "environment": getattr(record, "environment", None),
-        "created_at": (
-            created_at.isoformat() if hasattr(created_at, "isoformat") else created_at
-        ),
-        "updated_at": (
-            updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at
-        ),
-        "linked_kb_articles": resolution.get("linked_kb_articles", []),
-        "duplicate_ticket_ids": resolution.get("duplicate_ticket_ids", []),
-    }
-    if include_conversation:
-        payload["conversation"] = getattr(record, "conversation", None) or []
-        payload["messages"] = payload["conversation"]
-        payload["guardrail"] = getattr(record, "guardrail", None)
-        payload["raw_context"] = getattr(record, "raw_context", None) or {}
-    return payload
+    return get_ticket(db, parsed_ticket_id)
 
 
 def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
@@ -645,13 +608,6 @@ def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
         value = str(item.get(key) or "unknown")
         counts[value] = counts.get(value, 0) + 1
     return counts
-
-
-def _status_text_to_api(value: str) -> str:
-    parsed = _parse_status(value)
-    if parsed is not None:
-        return _status_to_api(parsed)
-    return str(value or "unknown").casefold().replace(" ", "_")
 
 
 def ticket_to_api(ticket: TicketRead, include_conversation: bool = False) -> dict[str, Any]:

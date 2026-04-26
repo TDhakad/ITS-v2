@@ -9,10 +9,17 @@ The LLM does all reasoning. Python handles only side effects and safety.
 from __future__ import annotations
 
 import contextvars
+import logging
 from functools import lru_cache
-from typing import Annotated, Any, Callable, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -22,7 +29,16 @@ try:
 except Exception:  # pragma: no cover
     SqliteSaver = None  # type: ignore[assignment]
 
-from app.db import SessionLocal, create_ticket as _db_create_ticket, find_duplicate_candidates, search_tickets as _db_search_tickets
+from app.db import (
+    SessionLocal,
+    find_duplicate_candidates,
+)
+from app.db import (
+    create_ticket as _db_create_ticket,
+)
+from app.db import (
+    search_tickets as _db_search_tickets,
+)
 from app.guardrails import evaluate_input_safety, redact_sensitive_text
 from app.llm import get_chat_model
 from app.rag import HybridRAGPipeline, context_from_user
@@ -42,13 +58,15 @@ from app.schemas import (
 from app.settings import get_settings
 from app.ticket_vector import search_ticket_vectors
 
+logger = logging.getLogger(__name__)
+
 
 # ── Per-request context ────────────────────────────────────────────────────────
-# Mutable dict so tool side effects (ticket_id, kb_refs) propagate back to the
-# caller after graph.invoke() — safe even across threads because we mutate the
-# same object rather than replacing it via ContextVar.set().
-_REQUEST_CTX: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
-    "helpdesk_request", default={}
+# Tool side effects (ticket_id, kb_refs) propagate back to the caller because a
+# per-request dict is installed before graph.invoke().
+_REQUEST_CTX: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "helpdesk_request",
+    default=None,
 )
 
 
@@ -66,6 +84,10 @@ class HelpdeskAgentState(TypedDict, total=False):
     # Set by guardrail_node when a request is blocked.
     is_blocked: bool
     route: str
+
+
+def _request_ctx() -> dict[str, Any]:
+    return _REQUEST_CTX.get() or {}
 
 
 def _scoped_ticket_user_id(ctx: dict[str, Any]) -> str | None:
@@ -107,7 +129,7 @@ def search_knowledge_base(query: str) -> str:
     (password resets, VPN problems, software installs, common errors, etc.).
     Always try this before creating a ticket for common issues.
     """
-    ctx = _REQUEST_CTX.get({})
+    ctx = _request_ctx()
     try:
         rag = HybridRAGPipeline()
         retrieval_ctx = context_from_user(
@@ -126,8 +148,9 @@ def search_knowledge_base(query: str) -> str:
             title = doc.metadata.get("title", "Article")
             blocks.append(f"[{i}] **{title}**\n{doc.page_content[:900]}")
         return "\n\n---\n\n".join(blocks)
-    except Exception as exc:
-        return f"Knowledge base search unavailable: {exc}"
+    except Exception:
+        logger.exception("Knowledge base search failed")
+        return "Knowledge base search unavailable."
 
 
 @tool
@@ -138,7 +161,7 @@ def search_existing_tickets(query: str) -> str:
     wants to check the status of a previous request, or asks about past incidents
     (e.g. "is there a ticket for JFrog access?", "any open ticket about VPN?").
     """
-    ctx = _REQUEST_CTX.get({})
+    ctx = _request_ctx()
     try:
         with SessionLocal() as db:
             results = _db_search_tickets(
@@ -157,8 +180,9 @@ def search_existing_tickets(query: str) -> str:
                 f"(filed {r['created_at'][:10] if r['created_at'] else 'unknown'})"
             )
         return "\n".join(lines)
-    except Exception as exc:
-        return f"Ticket search unavailable: {exc}"
+    except Exception:
+        logger.exception("Ticket search failed")
+        return "Ticket search unavailable."
 
 
 @tool
@@ -180,7 +204,7 @@ def vector_search_tickets(
     - priority: Low, Medium, High, or Critical
     - tags: impact-area slugs such as access, infra, security, network, ui
     """
-    ctx = _REQUEST_CTX.get({})
+    ctx = _request_ctx()
     try:
         results = search_ticket_vectors(
             query,
@@ -216,8 +240,9 @@ def vector_search_tickets(
                 )
             )
         return "\n\n".join(lines)
-    except Exception as exc:
-        return f"Ticket vector search unavailable: {exc}"
+    except Exception:
+        logger.exception("Ticket vector search failed")
+        return "Ticket vector search unavailable."
 
 
 @tool
@@ -237,7 +262,7 @@ def create_helpdesk_ticket(
     tags: optional list of impact-area slugs — pick from:
       ui, hardware, access, infra, security, network, performance, data
     """
-    ctx = _REQUEST_CTX.get({})
+    ctx = _request_ctx()
     try:
         conversation: list[ChatMessage] = [
             ChatMessage(
@@ -280,8 +305,9 @@ def create_helpdesk_ticket(
             f"Category: {category}, Priority: {priority}. "
             "The helpdesk team will review and follow up with you."
         )
-    except Exception as exc:
-        return f"Failed to create ticket: {exc}"
+    except Exception:
+        logger.exception("Helpdesk ticket creation failed")
+        return "Failed to create ticket."
 
 
 _TOOLS: list[BaseTool] = [
@@ -296,16 +322,25 @@ _SYSTEM_PROMPT = """\
 You are an IT helpdesk assistant. Help users resolve IT issues through natural conversation.
 
 How to handle requests:
-- Ask follow-up questions naturally when you need more details (e.g., which app, exact error message, how many users affected, since when).
-- To resolve issues: Always search the Knowledge Base (search_knowledge_base) AND historical tickets for potential solutions.
+- Ask follow-up questions naturally when you need more details, such as the app,
+  exact error message, affected users, and when the issue started.
+- To resolve issues: Always search the Knowledge Base (search_knowledge_base)
+  AND historical tickets for potential solutions.
     - Prioritize official KB articles: Provide clear, actionable steps from the KB first.
-    - Use vector_search_tickets when a user describes symptoms, impact, errors, or an issue in natural language and you need semantically similar historical tickets.
-    - Use search_existing_tickets when the user asks for exact ticket status, direct keyword matches, or whether a specific ticket/topic already exists.
-    - Fallback to past tickets: If the KB lacks an answer, look for verified fixes in similar past tickets.
-    - If helpful information is found, guide the user through it. If not, maintain a natural flow to gather more context.
-- To check statuses: When a user asks if a ticket already exists or wants an update on a past request, use search_existing_tickets to find their specific record.
-- Create a new ticket when: the issue requires admin/privileged access, hardware replacement, cannot be resolved via documentation/past fixes, or the user explicitly requests one.
-  When creating a ticket, always include relevant impact-area tags from: ui, hardware, access, infra, security, network, performance, data.
+    - Use vector_search_tickets when a user describes symptoms, impact, errors,
+      or an issue in natural language and you need semantically similar tickets.
+    - Use search_existing_tickets when the user asks for exact ticket status,
+      direct keyword matches, or whether a specific topic already exists.
+    - Fallback to past tickets: If the KB lacks an answer, look for verified fixes.
+    - If helpful information is found, guide the user through it. Otherwise,
+      maintain a natural flow to gather more context.
+- To check statuses: When a user asks if a ticket already exists or wants an
+  update on a past request, use search_existing_tickets to find their record.
+- Create a new ticket when: the issue requires admin/privileged access, hardware
+  replacement, cannot be resolved via documentation/past fixes, or the user
+  explicitly requests one.
+  When creating a ticket, always include relevant impact-area tags from: ui,
+  hardware, access, infra, security, network, performance, data.
 - Be concise and professional. This is a business IT support tool."""
 
 
@@ -324,7 +359,7 @@ def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
         return {"is_blocked": False}
 
     # Security event — auto-create a security ticket and block the request.
-    ctx = _REQUEST_CTX.get({})
+    ctx = _request_ctx()
     ticket_note = ""
     try:
         with SessionLocal() as db:
@@ -350,7 +385,7 @@ def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
         ctx["ticket_id"] = ticket.id
         ticket_note = f" Security ticket #{ticket.id} has been filed for review."
     except Exception:
-        pass
+        logger.exception("Failed to create security guardrail ticket")
 
     blocked_msg = AIMessage(
         content=(
@@ -367,11 +402,14 @@ def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
 
 def agent_node(state: HelpdeskAgentState) -> dict[str, Any]:
     # Snapshot messages so create_helpdesk_ticket can include the conversation.
-    ctx = _REQUEST_CTX.get({})
+    ctx = _request_ctx()
     ctx["messages_snapshot"] = list(state.get("messages", []))
 
     llm = get_chat_model().bind_tools(_TOOLS)
-    messages: list[BaseMessage] = [SystemMessage(content=_SYSTEM_PROMPT), *state.get("messages", [])]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=_SYSTEM_PROMPT),
+        *state.get("messages", []),
+    ]
     response = llm.invoke(messages)
     return {"messages": [response]}
 
@@ -394,8 +432,9 @@ def tools_node(state: HelpdeskAgentState) -> dict[str, Any]:
         else:
             try:
                 result_content = selected.invoke(tool_args)
-            except Exception as exc:
-                result_content = f"Tool error: {exc}"
+            except Exception:
+                logger.exception("Tool invocation failed: %s", tool_name)
+                result_content = "Tool error."
 
         results.append(
             ToolMessage(content=str(result_content), tool_call_id=tool_id, name=tool_name)

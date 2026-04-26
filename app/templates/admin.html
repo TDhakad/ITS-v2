@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ITS Admin</title>
     <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
-    <script src="{{ url_for('static', path='/admin.js') }}" defer></script>
+    <script src="{{ url_for('static', path='/admin.js') }}?v=analytics-2" defer></script>
   </head>
   <body data-page="admin">
     <a class="skip-link" href="#ticket-list">Skip to ticket list</a>
@@ -23,6 +23,25 @@
         <button class="button button-primary" id="refresh-button" type="button">Refresh</button>
       </nav>
     </header>
+
+    <section class="analytics-console" aria-label="Application analytics">
+      <div class="analytics-heading">
+        <div>
+          <p class="eyebrow">Application Q&A</p>
+          <h2>Analytics Agent</h2>
+        </div>
+      </div>
+      <div class="analytics-console-grid">
+        <form class="analytics-form" id="analytics-form">
+          <label for="analytics-question">Question</label>
+          <textarea id="analytics-question" name="question" rows="3" maxlength="1000" required placeholder="How many high priority tickets were created this month?"></textarea>
+          <button class="button button-primary" id="analytics-submit" type="button">Ask</button>
+        </form>
+        <div class="analytics-answer" id="analytics-answer" aria-live="polite">
+          <p class="muted">No analytics question asked yet.</p>
+        </div>
+      </div>
+    </section>
 
     <main class="admin-shell">
       <section class="ticket-column" aria-label="Tickets">

@@ -42,6 +42,166 @@ function pick(obj, keys, fallback = "") {
   return fallback;
 }
 
+function safeUrl(value) {
+  try {
+    const url = new URL(value, window.location.origin);
+    if (["http:", "https:", "mailto:"].includes(url.protocol)) {
+      return url.href;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function appendInlineText(parent, text) {
+  const inlinePattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(([^)\s]+)\)|https?:\/\/[^\s<]+)/g;
+  let cursor = 0;
+  for (const match of text.matchAll(inlinePattern)) {
+    if (match.index > cursor) {
+      parent.append(document.createTextNode(text.slice(cursor, match.index)));
+    }
+
+    const token = match[0];
+    if (token.startsWith("**") && token.endsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = token.slice(2, -2);
+      parent.append(strong);
+    } else if (token.startsWith("`") && token.endsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      parent.append(code);
+    } else if (token.startsWith("[")) {
+      const label = token.match(/^\[([^\]]+)\]/)?.[1] || "Link";
+      const href = safeUrl(match[2]);
+      if (href) {
+        const anchor = document.createElement("a");
+        anchor.href = href;
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+        anchor.textContent = label;
+        parent.append(anchor);
+      } else {
+        parent.append(document.createTextNode(label));
+      }
+    } else {
+      const href = safeUrl(token);
+      if (href) {
+        const anchor = document.createElement("a");
+        anchor.href = href;
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+        anchor.textContent = token;
+        parent.append(anchor);
+      } else {
+        parent.append(document.createTextNode(token));
+      }
+    }
+    cursor = match.index + token.length;
+  }
+
+  if (cursor < text.length) {
+    parent.append(document.createTextNode(text.slice(cursor)));
+  }
+}
+
+function appendParagraph(parent, lines) {
+  if (!lines.length) {
+    return;
+  }
+  const paragraph = document.createElement("p");
+  appendInlineText(paragraph, lines.join(" "));
+  parent.append(paragraph);
+}
+
+function appendCodeBlock(parent, lines) {
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.textContent = lines.join("\n");
+  pre.append(code);
+  parent.append(pre);
+}
+
+function renderAssistantContent(parent, text) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  let paragraphLines = [];
+  let list = null;
+  let codeLines = [];
+  let inCodeBlock = false;
+
+  const flushParagraph = () => {
+    appendParagraph(parent, paragraphLines);
+    paragraphLines = [];
+  };
+
+  const flushList = () => {
+    if (list) {
+      parent.append(list);
+      list = null;
+    }
+  };
+
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (inCodeBlock) {
+        appendCodeBlock(parent, codeLines);
+        codeLines = [];
+        inCodeBlock = false;
+      } else {
+        flushParagraph();
+        flushList();
+        inCodeBlock = true;
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(heading[1].length, 3);
+      const title = document.createElement(`h${level}`);
+      appendInlineText(title, heading[2]);
+      parent.append(title);
+      continue;
+    }
+
+    const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+    const numbered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (bullet || numbered) {
+      flushParagraph();
+      const listTag = numbered ? "ol" : "ul";
+      if (!list || list.tagName.toLowerCase() !== listTag) {
+        flushList();
+        list = document.createElement(listTag);
+      }
+      const item = document.createElement("li");
+      appendInlineText(item, (bullet || numbered)[1]);
+      list.append(item);
+      continue;
+    }
+
+    paragraphLines.push(line.trim());
+  }
+
+  if (inCodeBlock) {
+    appendCodeBlock(parent, codeLines);
+  }
+  flushParagraph();
+  flushList();
+}
+
 function appendMessage(role, text) {
   const article = document.createElement("article");
   const isUser = role === "user";
@@ -62,8 +222,8 @@ function appendMessage(role, text) {
   const content = document.createElement("div");
   content.className = "message-content";
   const rawText = normalizeText(text, "No response content returned.");
-  if (!isUser && typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
-    content.innerHTML = DOMPurify.sanitize(marked.parse(rawText));
+  if (!isUser) {
+    renderAssistantContent(content, rawText);
   } else {
     content.textContent = rawText;
   }

@@ -1,4 +1,3 @@
-from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -81,6 +80,5 @@ class Settings(BaseSettings):
         self.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-@lru_cache
 def get_settings() -> Settings:
     return Settings()

@@ -24,6 +24,10 @@ const insightSummary = document.querySelector("#insight-summary");
 const insightAction = document.querySelector("#insight-action");
 const insightSignals = document.querySelector("#insight-signals");
 const insightCitations = document.querySelector("#insight-citations");
+const analyticsForm = document.querySelector("#analytics-form");
+const analyticsQuestion = document.querySelector("#analytics-question");
+const analyticsSubmit = document.querySelector("#analytics-submit");
+const analyticsAnswer = document.querySelector("#analytics-answer");
 
 function normalizeText(value, fallback = "-") {
   if (typeof value === "string") {
@@ -312,6 +316,87 @@ async function fetchJson(url) {
   return response.json();
 }
 
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let message = `${url} failed with ${response.status}`;
+    try {
+      const payload = await response.json();
+      message = normalizeText(pick(payload, ["detail", "message", "error"], message));
+    } catch {
+      // Keep the status-based message.
+    }
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+function renderAnalyticsMessage(message, isError = false) {
+  analyticsAnswer.replaceChildren();
+  const text = document.createElement("p");
+  text.className = isError ? "analytics-error preserve-lines" : "preserve-lines";
+  text.textContent = normalizeText(message);
+  analyticsAnswer.append(text);
+}
+
+function renderAnalyticsTrace(trace) {
+  if (!trace || typeof trace !== "object") {
+    return;
+  }
+
+  const details = document.createElement("details");
+  details.className = "analytics-trace";
+  const summary = document.createElement("summary");
+  const toolCount = Array.isArray(trace.tools) ? trace.tools.length : 0;
+  const sqlCount = Array.isArray(trace.sql) ? trace.sql.length : 0;
+  const vectorCount = Array.isArray(trace.vector) ? trace.vector.length : 0;
+  summary.textContent = `Trace: ${trace.path || "analytics"} | ${trace.duration_ms || 0}ms | ${toolCount} tools | ${sqlCount} SQL | ${vectorCount} vector`;
+  details.append(summary);
+
+  const body = document.createElement("pre");
+  body.textContent = JSON.stringify(
+    {
+      tools: trace.tools || [],
+      sql: trace.sql || [],
+      vector: trace.vector || [],
+      errors: trace.errors || [],
+    },
+    null,
+    2,
+  );
+  details.append(body);
+  analyticsAnswer.append(details);
+}
+
+async function submitAnalyticsQuestion(event) {
+  event?.preventDefault();
+  const question = analyticsQuestion.value.trim();
+  if (!question) {
+    analyticsQuestion.focus();
+    return;
+  }
+
+  analyticsSubmit.disabled = true;
+  renderAnalyticsMessage("Running analysis...");
+  try {
+    const payload = await postJson("/api/admin/analytics", { question });
+    renderAnalyticsMessage(pick(payload, ["answer", "response", "message"], "No answer returned."));
+    renderAnalyticsTrace(payload.trace);
+  } catch (error) {
+    renderAnalyticsMessage(error.message || "Analytics request failed.", true);
+    console.error(error);
+  } finally {
+    analyticsSubmit.disabled = false;
+  }
+}
+
 async function loadTickets() {
   refreshButton.disabled = true;
   renderEmpty("Loading tickets...");
@@ -372,5 +457,7 @@ ticketFilters.addEventListener("submit", (event) => event.preventDefault());
 searchInput.addEventListener("input", applyFilters);
 statusFilter.addEventListener("change", applyFilters);
 priorityFilter.addEventListener("change", applyFilters);
+analyticsForm.addEventListener("submit", submitAnalyticsQuestion);
+analyticsSubmit.addEventListener("click", submitAnalyticsQuestion);
 
 loadTickets();

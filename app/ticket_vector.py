@@ -38,6 +38,10 @@ class TicketVectorResult:
     content: str
 
 
+class TicketVectorSearchUnavailable(RuntimeError):
+    """Raised when the configured ticket vector store cannot serve search."""
+
+
 def get_ticket_vectorstore(
     settings: Settings | None = None,
     *,
@@ -131,7 +135,7 @@ def search_ticket_vectors(
         )
     except Exception as exc:
         logger.warning("Ticket vector search unavailable: %s", exc)
-        return []
+        raise TicketVectorSearchUnavailable("Ticket vector search unavailable") from exc
 
     wanted_tags = set(_normalize_many(tag_slugs))
     results: list[TicketVectorResult] = []

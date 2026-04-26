@@ -6,39 +6,60 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, event, or_, select
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    cast,
+    create_engine,
+    event,
+    or_,
+    select,
+)
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.mutable import MutableDict, MutableList
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    relationship,
+    selectinload,
+    sessionmaker,
+)
 from sqlalchemy.types import JSON
 
 from app.schemas import (
-    ChatMessage,
     DEFAULT_TAG_SLUGS,
+    TAG_COLORS,
+    ChatMessage,
     Environment,
     GuardrailDecision,
     KBArticleRef,
-    MessageRole,
     Priority,
     ProjectAccessLevel,
     ProjectCreate,
-    ProjectRead,
     ResolutionData,
-    SessionRead,
-    TAG_COLORS,
-    TagRead,
     TicketCategory,
     TicketCreate,
     TicketIntelligence,
     TicketRead,
     TicketStatus,
     UserClearance,
-    UserRead,
     UserRole,
 )
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+class TicketVectorUnavailableError(RuntimeError):
+    """Raised when a configured ticket vector search cannot complete."""
 
 
 def utcnow() -> datetime:
@@ -54,7 +75,12 @@ settings = get_settings()
 
 def _engine_kwargs(database_url: str) -> dict[str, Any]:
     if database_url.startswith("sqlite"):
-        return {"connect_args": {"check_same_thread": False, "timeout": settings.sqlite_connect_timeout}}
+        return {
+            "connect_args": {
+                "check_same_thread": False,
+                "timeout": settings.sqlite_connect_timeout,
+            }
+        }
     return {}
 
 
@@ -121,7 +147,11 @@ class ProjectRecord(Base):
     name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     slug: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
-    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    owner_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -138,7 +168,10 @@ class ProjectMemberRecord(Base):
     __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_user"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        index=True,
+    )
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     access_level: Mapped[str] = mapped_column(String(40), default=ProjectAccessLevel.MEMBER.value)
 
@@ -194,7 +227,10 @@ class KBProjectLinkRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     kb_id: Mapped[str] = mapped_column(String(255), index=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        index=True,
+    )
 
     project: Mapped[ProjectRecord] = relationship(back_populates="kb_links")
 
@@ -209,18 +245,33 @@ class TicketRecord(Base):
     user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
     thread_id: Mapped[str] = mapped_column(String(120), index=True)
     app_name: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
-    environment: Mapped[str] = mapped_column(String(40), default=Environment.UNKNOWN.value, index=True)
+    environment: Mapped[str] = mapped_column(
+        String(40),
+        default=Environment.UNKNOWN.value,
+        index=True,
+    )
     user_clearance: Mapped[str] = mapped_column(String(40), default=UserClearance.PUBLIC.value)
 
-    category: Mapped[str] = mapped_column(String(128), default=TicketCategory.INFRA.value, index=True)
-    suggested_priority: Mapped[str] = mapped_column(String(40), default=Priority.MEDIUM.value, index=True)
+    category: Mapped[str] = mapped_column(
+        String(128),
+        default=TicketCategory.INFRA.value,
+        index=True,
+    )
+    suggested_priority: Mapped[str] = mapped_column(
+        String(40),
+        default=Priority.MEDIUM.value,
+        index=True,
+    )
     summary: Mapped[str] = mapped_column(Text, default="")
     keywords: Mapped[list[str]] = mapped_column(MutableList.as_mutable(JSON), default=list)
 
     intelligence: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
     resolution: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
     guardrail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    conversation: Mapped[list[dict[str, Any]]] = mapped_column(MutableList.as_mutable(JSON), default=list)
+    conversation: Mapped[list[dict[str, Any]]] = mapped_column(
+        MutableList.as_mutable(JSON),
+        default=list,
+    )
     raw_context: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
 
     # Project association
@@ -231,7 +282,11 @@ class TicketRecord(Base):
     # Legacy column retained so the generated SQLite DB from earlier scaffolding remains usable.
     sentiment: Mapped[str] = mapped_column(String(40), default="Calm")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        index=True,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
@@ -265,7 +320,11 @@ class TicketMessageRecord(Base):
     ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
     role: Mapped[str] = mapped_column(String(40), index=True)
     content: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        index=True,
+    )
 
     ticket: Mapped[TicketRecord] = relationship(back_populates="messages")
 
@@ -313,7 +372,9 @@ def ensure_database_directory() -> None:
 
 def init_db() -> None:
     ensure_database_directory()
-    Base.metadata.create_all(bind=engine)
+    from app.db_migrations import run_migrations
+
+    run_migrations(engine)
     with SessionLocal() as db:
         seed_default_tags(db)
 
@@ -327,8 +388,33 @@ def get_session() -> Generator[Session, None, None]:
         db.close()
 
 
+def _ticket_read_options() -> tuple[Any, ...]:
+    return (
+        selectinload(TicketRecord.messages),
+        selectinload(TicketRecord.tag_links).selectinload(TicketTagRecord.tag),
+    )
+
+
+def _tag_slugs_for_record(record: TicketRecord) -> list[str]:
+    return [link.tag.slug for link in (record.tag_links or []) if link.tag]
+
+
+def _conversation_for_record(record: TicketRecord) -> list[ChatMessage]:
+    if record.messages:
+        return [
+            ChatMessage.model_validate(
+                {
+                    "role": message.role,
+                    "content": message.content,
+                    "created_at": message.created_at,
+                }
+            )
+            for message in record.messages
+        ]
+    return [ChatMessage.model_validate(message) for message in record.conversation or []]
+
+
 def _ticket_to_read(record: TicketRecord) -> TicketRead:
-    tag_slugs = [link.tag.slug for link in (record.tag_links or []) if link.tag]
     return TicketRead(
         id=record.id,
         user_id=record.user_id,
@@ -338,10 +424,10 @@ def _ticket_to_read(record: TicketRecord) -> TicketRead:
         environment=Environment(record.environment),
         user_clearance=UserClearance(record.user_clearance),
         project_id=record.project_id,
-        tag_slugs=tag_slugs,
+        tag_slugs=_tag_slugs_for_record(record),
         intelligence=TicketIntelligence.model_validate(record.intelligence),
         resolution=ResolutionData.model_validate(record.resolution or {}),
-        conversation=[ChatMessage.model_validate(message) for message in record.conversation or []],
+        conversation=_conversation_for_record(record),
         guardrail=GuardrailDecision.model_validate(record.guardrail) if record.guardrail else None,
         raw_context=record.raw_context or {},
         created_at=record.created_at,
@@ -352,7 +438,6 @@ def _ticket_to_read(record: TicketRecord) -> TicketRead:
 def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
     intelligence = ticket.intelligence.model_dump(mode="json")
     resolution = ticket.resolution.model_dump(mode="json")
-    conversation = [message.model_dump(mode="json") for message in ticket.conversation]
     record = TicketRecord(
         status=ticket.status.value,
         user_id=ticket.user_id,
@@ -368,7 +453,8 @@ def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
         intelligence=intelligence,
         resolution=resolution,
         guardrail=ticket.guardrail.model_dump(mode="json") if ticket.guardrail else None,
-        conversation=conversation,
+        # ticket_messages is authoritative; the JSON column remains only for legacy DBs.
+        conversation=[],
         raw_context=ticket.raw_context,
     )
     db.add(record)
@@ -421,7 +507,11 @@ def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
 
 
 def get_ticket(db: Session, ticket_id: int) -> TicketRead | None:
-    record = db.get(TicketRecord, ticket_id)
+    record = db.scalars(
+        select(TicketRecord)
+        .options(*_ticket_read_options())
+        .where(TicketRecord.id == ticket_id)
+    ).first()
     return _ticket_to_read(record) if record else None
 
 
@@ -454,7 +544,8 @@ def list_tickets(
             .where(TagRecord.slug == tag_slug)
         )
     stmt = stmt.limit(limit)
-    return [_ticket_to_read(record) for record in db.scalars(stmt).all()]
+    stmt = stmt.options(*_ticket_read_options())
+    return [_ticket_to_read(record) for record in db.scalars(stmt).unique().all()]
 
 
 def search_tickets(
@@ -471,7 +562,7 @@ def search_tickets(
     """Semantic ticket search with keyword fallback.
 
     Pinecone handles content-level recall when the ticket vector index is
-    available. The older SQL keyword search stays as a zero-dependency fallback.
+    configured. SQL keyword search remains the zero-dependency local fallback.
     """
     if not query or not query.strip():
         return []
@@ -490,7 +581,14 @@ def search_tickets(
     if not tokens:
         return vector_results[:limit]
 
-    stmt = select(TicketRecord).order_by(TicketRecord.created_at.desc()).limit(500)
+    conditions = _ticket_match_conditions(tokens)
+    stmt = (
+        select(TicketRecord)
+        .options(*_ticket_read_options())
+        .where(or_(*conditions))
+        .order_by(TicketRecord.created_at.desc())
+        .limit(max(limit * 8, 50))
+    )
     if user_id:
         stmt = stmt.where(TicketRecord.user_id == user_id)
     if project_id is not None:
@@ -507,13 +605,9 @@ def search_tickets(
         )
 
     results: list[dict[str, Any]] = []
-    for record in db.scalars(stmt).all():
-        summary_lower = (record.summary or "").casefold()
-        keywords_lower = " ".join(record.keywords or []).casefold()
-        combined = f"{summary_lower} {keywords_lower}"
-        hits = sum(1 for token in tokens if token in combined)
+    for record in db.scalars(stmt).unique().all():
+        hits = _ticket_search_score(record, tokens)
         if hits > 0:
-            tag_slugs_found = [link.tag.slug for link in (record.tag_links or []) if link.tag]
             results.append(
                 {
                     "ticket_id": record.id,
@@ -523,9 +617,10 @@ def search_tickets(
                     "category": record.category,
                     "user_id": record.user_id,
                     "project_id": record.project_id,
-                    "tags": tag_slugs_found,
+                    "tags": _tag_slugs_for_record(record),
                     "created_at": record.created_at.isoformat() if record.created_at else None,
                     "score": hits,
+                    "source": "sql",
                 }
             )
 
@@ -550,17 +645,27 @@ def find_duplicate_candidates(
     if not keywords:
         return []
 
-    vector_results = _search_ticket_vectors(
-        " ".join(keywords),
-        exclude_ticket_id=exclude_ticket_id,
-        limit=limit,
-    )
+    try:
+        vector_results = _search_ticket_vectors(
+            " ".join(keywords),
+            exclude_ticket_id=exclude_ticket_id,
+            limit=limit,
+        )
+    except TicketVectorUnavailableError:
+        logger.warning("Skipping duplicate vector search because the ticket vector store failed")
+        vector_results = []
 
-    stmt = select(TicketRecord).order_by(TicketRecord.created_at.desc()).limit(250)
+    wanted = {keyword.casefold() for keyword in keywords}
+    duplicate_conditions = _ticket_match_conditions(list(wanted))
+    stmt = (
+        select(TicketRecord)
+        .where(or_(*duplicate_conditions))
+        .order_by(TicketRecord.created_at.desc())
+        .limit(max(limit * 10, 50))
+    )
     if exclude_ticket_id is not None:
         stmt = stmt.where(TicketRecord.id != exclude_ticket_id)
 
-    wanted = {keyword.casefold() for keyword in keywords}
     matches: list[dict[str, Any]] = []
     for record in db.scalars(stmt).all():
         existing = {keyword.casefold() for keyword in (record.keywords or [])}
@@ -590,6 +695,41 @@ def find_duplicate_candidates(
     return merged[:limit]
 
 
+def _like_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _ticket_match_conditions(tokens: list[str]) -> list[Any]:
+    keyword_text = cast(TicketRecord.keywords, String)
+    conditions: list[Any] = []
+    for token in tokens:
+        pattern = _like_pattern(token)
+        conditions.extend(
+            [
+                TicketRecord.summary.ilike(pattern, escape="\\"),
+                TicketRecord.category.ilike(pattern, escape="\\"),
+                TicketRecord.app_name.ilike(pattern, escape="\\"),
+                TicketRecord.environment.ilike(pattern, escape="\\"),
+                keyword_text.ilike(pattern, escape="\\"),
+            ]
+        )
+    return conditions
+
+
+def _ticket_search_score(record: TicketRecord, tokens: list[str]) -> int:
+    combined = " ".join(
+        [
+            record.summary or "",
+            " ".join(record.keywords or []),
+            record.category or "",
+            record.app_name or "",
+            record.environment or "",
+        ]
+    ).casefold()
+    return sum(1 for token in tokens if token in combined)
+
+
 def _index_ticket_vector(ticket: TicketRead) -> None:
     try:
         from app.ticket_vector import index_ticket
@@ -610,25 +750,29 @@ def _search_ticket_vectors(
     exclude_ticket_id: int | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
+    if not settings.pinecone_api_key:
+        return []
+
     try:
         from app.ticket_vector import search_ticket_vectors, ticket_vector_result_to_api
-
-        return [
-            ticket_vector_result_to_api(result)
-            for result in search_ticket_vectors(
-                query,
-                user_id=user_id,
-                project_id=project_id,
-                tag_slugs=tag_slugs,
-                status=status,
-                priority=priority,
-                exclude_ticket_id=exclude_ticket_id,
-                limit=limit,
-            )
-        ]
     except Exception as exc:
-        logger.warning("Ticket vector search failed: %s", exc)
-        return []
+        raise TicketVectorUnavailableError("Ticket vector search dependency unavailable") from exc
+
+    try:
+        results = search_ticket_vectors(
+            query,
+            user_id=user_id,
+            project_id=project_id,
+            tag_slugs=tag_slugs,
+            status=status,
+            priority=priority,
+            exclude_ticket_id=exclude_ticket_id,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise TicketVectorUnavailableError("Ticket vector search failed") from exc
+
+    return [ticket_vector_result_to_api(result) for result in results]
 
 
 def kb_refs_from_records(records: list[TicketKBLinkRecord]) -> list[KBArticleRef]:
