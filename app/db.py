@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,8 @@ from app.schemas import (
     UserRole,
 )
 from app.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
@@ -412,7 +415,9 @@ def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
 
     db.commit()
     db.refresh(record)
-    return _ticket_to_read(record)
+    ticket_read = _ticket_to_read(record)
+    _index_ticket_vector(ticket_read)
+    return ticket_read
 
 
 def get_ticket(db: Session, ticket_id: int) -> TicketRead | None:
@@ -463,18 +468,27 @@ def search_tickets(
     priority: str | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Full-text search across ticket summary and keywords with optional metadata filters.
+    """Semantic ticket search with keyword fallback.
 
-    Tokenises the query and scores tickets by term overlap.
-    All filter params are applied as SQL predicates before the Python-side scoring,
-    making this efficient even on large tables.
+    Pinecone handles content-level recall when the ticket vector index is
+    available. The older SQL keyword search stays as a zero-dependency fallback.
     """
     if not query or not query.strip():
         return []
 
+    vector_results = _search_ticket_vectors(
+        query,
+        user_id=user_id,
+        project_id=project_id,
+        tag_slugs=tag_slugs,
+        status=status,
+        priority=priority,
+        limit=limit,
+    )
+
     tokens = [token.casefold() for token in query.split() if len(token) > 2]
     if not tokens:
-        return []
+        return vector_results[:limit]
 
     stmt = select(TicketRecord).order_by(TicketRecord.created_at.desc()).limit(500)
     if user_id:
@@ -516,16 +530,31 @@ def search_tickets(
             )
 
     results.sort(key=lambda r: r["score"], reverse=True)
-    return results[:limit]
+    if not vector_results:
+        return results[:limit]
+
+    seen = {result["ticket_id"] for result in vector_results}
+    merged = [
+        *vector_results,
+        *(result for result in results if result["ticket_id"] not in seen),
+    ]
+    return merged[:limit]
 
 
-def find_duplicate_candidates(    db: Session,
+def find_duplicate_candidates(
+    db: Session,
     keywords: list[str],
     exclude_ticket_id: int | None = None,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     if not keywords:
         return []
+
+    vector_results = _search_ticket_vectors(
+        " ".join(keywords),
+        exclude_ticket_id=exclude_ticket_id,
+        limit=limit,
+    )
 
     stmt = select(TicketRecord).order_by(TicketRecord.created_at.desc()).limit(250)
     if exclude_ticket_id is not None:
@@ -542,7 +571,64 @@ def find_duplicate_candidates(    db: Session,
             matches.append({"ticket_id": record.id, "summary": record.summary, "score": score})
 
     matches.sort(key=lambda item: item["score"], reverse=True)
-    return matches[:limit]
+    vector_matches = [
+        {
+            "ticket_id": result["ticket_id"],
+            "summary": result["summary"],
+            "score": result["score"],
+        }
+        for result in vector_results
+    ]
+    if not vector_matches:
+        return matches[:limit]
+
+    seen = {result["ticket_id"] for result in vector_matches}
+    merged = [
+        *vector_matches,
+        *(result for result in matches if result["ticket_id"] not in seen),
+    ]
+    return merged[:limit]
+
+
+def _index_ticket_vector(ticket: TicketRead) -> None:
+    try:
+        from app.ticket_vector import index_ticket
+
+        index_ticket(ticket)
+    except Exception as exc:
+        logger.warning("Ticket vector indexing failed for ticket %s: %s", ticket.id, exc)
+
+
+def _search_ticket_vectors(
+    query: str,
+    *,
+    user_id: str | None = None,
+    project_id: int | None = None,
+    tag_slugs: list[str] | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    exclude_ticket_id: int | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    try:
+        from app.ticket_vector import search_ticket_vectors, ticket_vector_result_to_api
+
+        return [
+            ticket_vector_result_to_api(result)
+            for result in search_ticket_vectors(
+                query,
+                user_id=user_id,
+                project_id=project_id,
+                tag_slugs=tag_slugs,
+                status=status,
+                priority=priority,
+                exclude_ticket_id=exclude_ticket_id,
+                limit=limit,
+            )
+        ]
+    except Exception as exc:
+        logger.warning("Ticket vector search failed: %s", exc)
+        return []
 
 
 def kb_refs_from_records(records: list[TicketKBLinkRecord]) -> list[KBArticleRef]:
@@ -707,4 +793,3 @@ def get_kb_project_ids(db: Session, kb_id: str) -> list[int]:
         select(KBProjectLinkRecord.project_id).where(KBProjectLinkRecord.kb_id == kb_id)
     ).all()
     return list(rows)
-

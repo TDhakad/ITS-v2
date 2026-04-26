@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -11,13 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from langchain_community.document_compressors import FlashrankRerank
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
 from app.rag_ingest import (
     DEFAULT_CLEARANCE_LEVEL,
-    DEFAULT_COLLECTION_NAME,
+    DEFAULT_KB_INDEX_NAME,
     _clearance_label,
     _coerce_clearance_level,
     _normalize_many,
@@ -30,8 +28,6 @@ from app.schemas import Environment, KBArticleRef, TicketCategory, UserClearance
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
-
-TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
 
 CATEGORY_ALIASES = {
     "infra": ["infra", "network", "accounts", "security", "vpn", "identity"],
@@ -76,27 +72,23 @@ class _Candidate:
     vector_rank: int | None = None
     keyword_rank: int | None = None
 
-
-def tokenize(text: str) -> list[str]:
-    return TOKEN_RE.findall(text.lower())
-
-
 class KnowledgeBaseRAG:
-    """Hybrid Chroma vector plus BM25 keyword retriever."""
+    """Pinecone vector retriever for KB articles."""
 
     def __init__(
         self,
         *,
         persist_directory: str | Path | None = None,
-        collection_name: str = DEFAULT_COLLECTION_NAME,
+        collection_name: str | None = None,
+        index_name: str | None = None,
         embedding: Embeddings | None = None,
         reranker: FlashrankRerank | None = None,
     ) -> None:
-        self.persist_directory = Path(persist_directory or get_settings().chroma_dir)
-        self.collection_name = collection_name
+        self.persist_directory = Path(persist_directory) if persist_directory else None
+        self.index_name = index_name or collection_name or get_settings().pinecone_kb_index_name
         self.vectorstore = get_vectorstore(
             persist_directory=self.persist_directory,
-            collection_name=collection_name,
+            index_name=self.index_name,
             embedding=embedding,
         )
         self.reranker = reranker
@@ -110,43 +102,33 @@ class KnowledgeBaseRAG:
         clearance_level: int | str | UserClearance | None = None,
         k: int = 5,
         vector_k: int | None = None,
-        keyword_k: int | None = None,
         rerank: bool = True,
         rerank_top_n: int | None = None,
-        vector_weight: float = 0.55,
-        keyword_weight: float = 0.45,
     ) -> list[RetrievalResult]:
         clean_query = query.strip()
         if not clean_query:
             return []
 
-        where_filter = build_chroma_filter(
+        where_filter = build_pinecone_filter(
             user_context,
             category=category,
             clearance_level=clearance_level,
         )
-        collection_count = self._collection_count()
-        if collection_count == 0:
-            return []
         vector_limit = vector_k or max(k * 4, k)
-        if collection_count > 0:
-            vector_limit = min(vector_limit, collection_count)
         vector_results = self._vector_search(
             clean_query,
             vector_limit,
             where_filter,
         )
-        keyword_docs = self._keyword_search(
-            clean_query,
-            keyword_k or max(k * 4, k),
-            where_filter,
-        )
-        candidates = self._fuse_results(
-            vector_results=vector_results,
-            keyword_docs=keyword_docs,
-            vector_weight=vector_weight,
-            keyword_weight=keyword_weight,
-        )
+        candidates = [
+            _Candidate(
+                document=document,
+                score=score or 0.0,
+                vector_score=score,
+                vector_rank=rank,
+            )
+            for rank, (document, score) in enumerate(vector_results, start=1)
+        ]
         if not candidates:
             return []
 
@@ -174,12 +156,6 @@ class KnowledgeBaseRAG:
     def retrieve_documents(self, query: str, **kwargs: Any) -> list[Document]:
         return [result.document for result in self.retrieve(query, **kwargs)]
 
-    def _collection_count(self) -> int:
-        try:
-            return int(self.vectorstore._collection.count())
-        except Exception:
-            return -1
-
     def _vector_search(
         self,
         query: str,
@@ -195,69 +171,10 @@ class KnowledgeBaseRAG:
         except Exception as exc:
             logger.warning("Vector search failed: %s", exc)
             return []
-        return [(document, 1.0 / (1.0 + max(float(score), 0.0))) for document, score in raw_results]
-
-    def _keyword_search(
-        self,
-        query: str,
-        limit: int,
-        where_filter: dict[str, Any] | None,
-    ) -> list[Document]:
-        candidates = self._documents_matching_filter(where_filter)
-        if not candidates:
-            return []
-        try:
-            retriever = BM25Retriever.from_documents(candidates, preprocess_func=tokenize)
-            retriever.k = limit
-            return retriever.invoke(query)
-        except Exception as exc:
-            logger.warning("Keyword search failed: %s", exc)
-            return []
-
-    def _documents_matching_filter(self, where_filter: dict[str, Any] | None) -> list[Document]:
-        try:
-            if where_filter:
-                raw = self.vectorstore.get(where=where_filter, include=["documents", "metadatas"])
-            else:
-                raw = self.vectorstore.get(include=["documents", "metadatas"])
-        except Exception as exc:
-            logger.warning("Unable to load keyword candidates from Chroma: %s", exc)
-            return []
-
-        documents = raw.get("documents") or []
-        metadatas = raw.get("metadatas") or []
         return [
-            Document(page_content=content, metadata=metadata or {})
-            for content, metadata in zip(documents, metadatas, strict=False)
-            if content
+            (document, float(score) if score is not None else None)
+            for document, score in raw_results
         ]
-
-    def _fuse_results(
-        self,
-        *,
-        vector_results: Sequence[tuple[Document, float | None]],
-        keyword_docs: Sequence[Document],
-        vector_weight: float,
-        keyword_weight: float,
-        rrf_k: int = 60,
-    ) -> list[_Candidate]:
-        candidates: dict[str, _Candidate] = {}
-
-        for rank, (document, relevance_score) in enumerate(vector_results, start=1):
-            key = _document_key(document)
-            candidate = candidates.setdefault(key, _Candidate(document=document))
-            candidate.vector_rank = rank
-            candidate.vector_score = relevance_score
-            candidate.score += vector_weight / (rrf_k + rank)
-
-        for rank, document in enumerate(keyword_docs, start=1):
-            key = _document_key(document)
-            candidate = candidates.setdefault(key, _Candidate(document=document))
-            candidate.keyword_rank = rank
-            candidate.keyword_score = 1.0 / rank
-            candidate.score += keyword_weight / (rrf_k + rank)
-
-        return sorted(candidates.values(), key=lambda candidate: candidate.score, reverse=True)
 
     def _rerank(
         self,
@@ -283,12 +200,11 @@ class KnowledgeBaseRAG:
 
 
 @lru_cache(maxsize=8)
-def _get_kb_rag(persist_directory: str, collection_name: str) -> KnowledgeBaseRAG:
+def _get_kb_rag(index_name: str) -> KnowledgeBaseRAG:
     """Return a cached KnowledgeBaseRAG so the vectorstore and embedding model
-    are initialised only once per (directory, collection) pair per process."""
+    are initialised only once per index per process."""
     return KnowledgeBaseRAG(
-        persist_directory=persist_directory,
-        collection_name=collection_name,
+        index_name=index_name,
     )
 
 
@@ -304,13 +220,12 @@ class HybridRAGPipeline:
     def ingest(self) -> int:
         report = ingest_markdown_kb(
             kb_dir=self.settings.kb_dir,
-            persist_directory=self.settings.chroma_dir,
-            collection_name=DEFAULT_COLLECTION_NAME,
+            index_name=self.settings.pinecone_kb_index_name,
         )
         return report.chunks
 
     def retrieve(self, query: str, context: RetrievalContext, k: int = 5) -> list[Document]:
-        rag = _get_kb_rag(str(self.settings.chroma_dir), DEFAULT_COLLECTION_NAME)
+        rag = _get_kb_rag(self.settings.pinecone_kb_index_name or DEFAULT_KB_INDEX_NAME)
         return rag.retrieve_documents(query, user_context=context, k=k)
 
     def article_refs(self, docs: list[Document]) -> list[KBArticleRef]:
@@ -334,14 +249,14 @@ class HybridRAGPipeline:
         return refs
 
 
-def build_chroma_filter(
+def build_pinecone_filter(
     context: RetrievalContext | Mapping[str, Any] | Any | None = None,
     *,
     user_context: RetrievalContext | Mapping[str, Any] | Any | None = None,
     category: TicketCategory | str | None = None,
     clearance_level: int | str | UserClearance | None = None,
 ) -> dict[str, Any] | None:
-    """Build a Chroma metadata filter before vector similarity search."""
+    """Build a Pinecone metadata filter before vector similarity search."""
 
     active_context = user_context if user_context is not None else context
     context_dict = _context_to_dict(active_context)

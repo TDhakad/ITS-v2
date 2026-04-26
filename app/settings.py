@@ -24,11 +24,19 @@ class Settings(BaseSettings):
         default="sentence-transformers/all-MiniLM-L6-v2",
         alias="HUGGINGFACE_EMBEDDING_MODEL",
     )
+    pinecone_api_key: str | None = Field(default=None, alias="PINECONE_API_KEY")
+    pinecone_kb_index_name: str = Field(
+        default="its-knowledge-base",
+        alias="PINECONE_KB_INDEX_NAME",
+    )
+    pinecone_ticket_index_name: str = Field(
+        default="its-tickets",
+        alias="PINECONE_TICKET_INDEX_NAME",
+    )
     database_url: str = Field(default="sqlite:///./data/helpdesk.db", alias="DATABASE_URL")
     sqlite_connect_timeout: float = Field(default=30.0, alias="SQLITE_CONNECT_TIMEOUT", gt=0)
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
 
-    chroma_dir: Path = Field(default=Path("./data/chroma"), alias="CHROMA_DIR")
     kb_dir: Path = Field(default=Path("./kb"), alias="KB_DIR")
     max_requirement_turns: int = Field(default=3, alias="MAX_REQUIREMENT_TURNS", ge=1, le=10)
     standard_user_clearance: str = Field(default="public", alias="STANDARD_USER_CLEARANCE")
@@ -68,12 +76,7 @@ class Settings(BaseSettings):
 
         return Path(self.database_url.removeprefix(prefix))
 
-    @property
-    def chroma_persist_directory(self) -> str:
-        return str(self.chroma_dir)
-
     def ensure_local_dirs(self) -> None:
-        self.chroma_dir.mkdir(parents=True, exist_ok=True)
         self.kb_dir.mkdir(parents=True, exist_ok=True)
         self.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 

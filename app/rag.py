@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from app.rag_ingest import (
-    DEFAULT_CHROMA_DIR,
     DEFAULT_COLLECTION_NAME,
+    DEFAULT_KB_INDEX_NAME,
     DEFAULT_KB_DIR,
     IngestionReport,
     get_vectorstore,
@@ -18,7 +18,7 @@ from app.rag_retrieve import (
     KnowledgeBaseRAG,
     RetrievalContext,
     RetrievalResult,
-    build_chroma_filter,
+    build_pinecone_filter,
     clearance_values,
     context_from_user,
     format_context,
@@ -30,8 +30,8 @@ def ingest_knowledge_base() -> int:
 
 
 __all__ = [
-    "DEFAULT_CHROMA_DIR",
     "DEFAULT_COLLECTION_NAME",
+    "DEFAULT_KB_INDEX_NAME",
     "DEFAULT_KB_DIR",
     "IngestionReport",
     "RetrievalContext",
@@ -44,7 +44,7 @@ __all__ = [
     "split_documents",
     "ingest_markdown_kb",
     "ingest_knowledge_base",
-    "build_chroma_filter",
+    "build_pinecone_filter",
     "clearance_values",
     "context_from_user",
     "format_context",

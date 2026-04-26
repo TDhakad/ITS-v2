@@ -36,9 +36,11 @@ from app.schemas import (
     TicketCategory,
     TicketCreate,
     TicketIntelligence,
+    TicketStatus,
     UserClearance,
 )
 from app.settings import get_settings
+from app.ticket_vector import search_ticket_vectors
 
 
 # ── Per-request context ────────────────────────────────────────────────────────
@@ -64,6 +66,35 @@ class HelpdeskAgentState(TypedDict, total=False):
     # Set by guardrail_node when a request is blocked.
     is_blocked: bool
     route: str
+
+
+def _scoped_ticket_user_id(ctx: dict[str, Any]) -> str | None:
+    try:
+        clearance = UserClearance(ctx.get("user_clearance", UserClearance.PUBLIC))
+    except ValueError:
+        clearance = UserClearance.PUBLIC
+    if clearance == UserClearance.RESTRICTED:
+        return None
+    return ctx.get("user_id")
+
+
+def _enum_value(value: str | None, enum_cls: Any) -> str | None:
+    if not value:
+        return None
+    normalized = str(value).strip().casefold().replace("-", " ").replace("_", " ")
+    for item in enum_cls:
+        item_value = str(item.value)
+        item_normalized = item_value.casefold().replace("-", " ").replace("_", " ")
+        if normalized in {item_normalized, item.name.casefold()}:
+            return item_value
+    return str(value).strip()
+
+
+def _shorten_tool_text(value: str, *, max_chars: int) -> str:
+    clean = " ".join(value.split())
+    if len(clean) <= max_chars:
+        return clean
+    return f"{clean[:max_chars].rstrip()}..."
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
@@ -113,7 +144,7 @@ def search_existing_tickets(query: str) -> str:
             results = _db_search_tickets(
                 db,
                 query,
-                user_id=ctx.get("user_id") if ctx.get("user_clearance") != "restricted" else None,
+                user_id=_scoped_ticket_user_id(ctx),
                 project_id=ctx.get("project_id"),
                 limit=5,
             )
@@ -128,6 +159,65 @@ def search_existing_tickets(query: str) -> str:
         return "\n".join(lines)
     except Exception as exc:
         return f"Ticket search unavailable: {exc}"
+
+
+@tool
+def vector_search_tickets(
+    query: str,
+    status: str | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Semantic vector search over historical tickets in Pinecone.
+
+    Use this when the user describes an issue in natural language and similar
+    past tickets may contain useful context, fixes, duplicate incidents, or
+    escalation patterns. This searches ticket summaries, keywords, linked KB
+    refs, suggested fixes, and conversation text.
+
+    Optional filters:
+    - status: Open, Triaged, In Progress, Resolved, or Closed
+    - priority: Low, Medium, High, or Critical
+    - tags: impact-area slugs such as access, infra, security, network, ui
+    """
+    ctx = _REQUEST_CTX.get({})
+    try:
+        results = search_ticket_vectors(
+            query,
+            user_id=_scoped_ticket_user_id(ctx),
+            project_id=ctx.get("project_id"),
+            tag_slugs=tags,
+            status=_enum_value(status, TicketStatus),
+            priority=_enum_value(priority, Priority),
+            limit=5,
+        )
+        if not results:
+            return f"No semantically similar tickets found for '{query}'."
+
+        lines = [f"Found {len(results)} semantically similar ticket(s):"]
+        for index, result in enumerate(results, start=1):
+            metadata = result.metadata
+            created_at = str(metadata.get("created_at") or "")
+            filed = created_at[:10] if created_at else "unknown"
+            content = _shorten_tool_text(result.content, max_chars=700)
+            lines.append(
+                "\n".join(
+                    [
+                        (
+                            f"[{index}] Ticket #{result.ticket_id} "
+                            f"[{metadata.get('status', 'unknown')} / "
+                            f"{metadata.get('priority', 'unknown')}] "
+                            f"score={result.score:.2f}"
+                        ),
+                        f"summary: {result.summary}",
+                        f"category: {metadata.get('category', 'unknown')}; filed: {filed}",
+                        f"context: {content}",
+                    ]
+                )
+            )
+        return "\n\n".join(lines)
+    except Exception as exc:
+        return f"Ticket vector search unavailable: {exc}"
 
 
 @tool
@@ -194,7 +284,12 @@ def create_helpdesk_ticket(
         return f"Failed to create ticket: {exc}"
 
 
-_TOOLS: list[BaseTool] = [search_knowledge_base, search_existing_tickets, create_helpdesk_ticket]
+_TOOLS: list[BaseTool] = [
+    search_knowledge_base,
+    search_existing_tickets,
+    vector_search_tickets,
+    create_helpdesk_ticket,
+]
 _TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in _TOOLS}
 
 _SYSTEM_PROMPT = """\
@@ -202,8 +297,10 @@ You are an IT helpdesk assistant. Help users resolve IT issues through natural c
 
 How to handle requests:
 - Ask follow-up questions naturally when you need more details (e.g., which app, exact error message, how many users affected, since when).
-- To resolve issues: Always search the Knowledge Base (search_knowledge_base) AND historical resolved tickets (search_existing_tickets) for potential solutions.
+- To resolve issues: Always search the Knowledge Base (search_knowledge_base) AND historical tickets for potential solutions.
     - Prioritize official KB articles: Provide clear, actionable steps from the KB first.
+    - Use vector_search_tickets when a user describes symptoms, impact, errors, or an issue in natural language and you need semantically similar historical tickets.
+    - Use search_existing_tickets when the user asks for exact ticket status, direct keyword matches, or whether a specific ticket/topic already exists.
     - Fallback to past tickets: If the KB lacks an answer, look for verified fixes in similar past tickets.
     - If helpful information is found, guide the user through it. If not, maintain a natural flow to gather more context.
 - To check statuses: When a user asks if a ticket already exists or wants an update on a past request, use search_existing_tickets to find their specific record.

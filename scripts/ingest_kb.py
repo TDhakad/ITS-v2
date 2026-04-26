@@ -1,4 +1,4 @@
-"""Ingest Markdown knowledge-base files into the local Chroma collection."""
+"""Ingest Markdown knowledge-base files into the Pinecone KB index."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.rag import (  # noqa: E402
-    DEFAULT_COLLECTION_NAME,
     DEFAULT_KB_DIR,
     KnowledgeBaseRAG,
     format_context,
@@ -24,14 +23,13 @@ def parse_args() -> argparse.Namespace:
     settings = get_settings()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kb-dir", type=Path, default=DEFAULT_KB_DIR)
-    parser.add_argument("--persist-dir", type=Path, default=settings.chroma_dir)
-    parser.add_argument("--collection-name", default=DEFAULT_COLLECTION_NAME)
+    parser.add_argument("--index-name", default=settings.pinecone_kb_index_name)
     parser.add_argument("--chunk-size", type=int, default=900)
     parser.add_argument("--chunk-overlap", type=int, default=120)
     parser.add_argument(
         "--no-reset",
         action="store_true",
-        help="Append/upsert into the existing collection instead of recreating it.",
+        help="Append/upsert into the existing index instead of clearing it first.",
     )
     parser.add_argument("--smoke-query", help="Run a retrieval check after ingestion.")
     parser.add_argument("--role", default="employee", help="Role for the optional smoke query.")
@@ -55,8 +53,7 @@ def main() -> None:
     args = parse_args()
     report = ingest_markdown_kb(
         kb_dir=args.kb_dir,
-        persist_directory=args.persist_dir,
-        collection_name=args.collection_name,
+        index_name=args.index_name,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         reset=not args.no_reset,
@@ -67,8 +64,7 @@ def main() -> None:
             [
                 "Knowledge base ingested.",
                 f"kb_dir: {report.kb_dir}",
-                f"persist_directory: {report.persist_directory}",
-                f"collection_name: {report.collection_name}",
+                f"index_name: {report.index_name}",
                 f"source_documents: {report.source_documents}",
                 f"chunks: {report.chunks}",
             ]
@@ -77,8 +73,7 @@ def main() -> None:
 
     if args.smoke_query:
         rag = KnowledgeBaseRAG(
-            persist_directory=args.persist_dir,
-            collection_name=args.collection_name,
+            index_name=args.index_name,
         )
         results = rag.retrieve(
             args.smoke_query,

@@ -1,22 +1,19 @@
-"""KB ingestion and Chroma storage helpers."""
+"""KB ingestion and Pinecone storage helpers."""
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-
-from langchain_chroma import Chroma
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import MarkdownHeaderTextSplitter, MarkdownTextSplitter
 
 from app.llm import get_embedding_model
@@ -27,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KB_DIR = PROJECT_ROOT / "kb"
-DEFAULT_CHROMA_DIR = PROJECT_ROOT / "data" / "chroma"
-DEFAULT_COLLECTION_NAME = "it_helpdesk_kb"
+DEFAULT_KB_INDEX_NAME = "its-knowledge-base"
+DEFAULT_COLLECTION_NAME = DEFAULT_KB_INDEX_NAME
 DEFAULT_CLEARANCE_LEVEL = 0
 
 FRONT_MATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
@@ -48,41 +45,30 @@ CLEARANCE_ALIASES = {
 @dataclass(frozen=True)
 class IngestionReport:
     kb_dir: Path
-    persist_directory: Path
-    collection_name: str
+    index_name: str
     source_documents: int
     chunks: int
     chunk_size: int
     chunk_overlap: int
 
 
-def _chroma_client_settings() -> Any | None:
-    try:
-        from chromadb.config import Settings as ChromaClientSettings
-    except Exception:
-        return None
-    return ChromaClientSettings(anonymized_telemetry=False, is_persistent=True)
-
-
 def get_vectorstore(
     settings: Settings | None = None,
     *,
     persist_directory: str | Path | None = None,
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: str | None = None,
+    index_name: str | None = None,
     embedding: Embeddings | None = None,
-) -> Chroma:
-    if settings is not None:
-        persist_path = settings.chroma_dir
-    else:
-        persist_path = Path(persist_directory or DEFAULT_CHROMA_DIR)
-    persist_path.mkdir(parents=True, exist_ok=True)
-    client_settings = _chroma_client_settings()
-    return Chroma(
-        collection_name=collection_name,
-        persist_directory=str(persist_path),
-        embedding_function=embedding or get_embedding_model(settings),
-        client_settings=client_settings,
-        collection_metadata={"hnsw:space": "cosine"},
+) -> PineconeVectorStore:
+    del persist_directory
+    active_settings = settings or get_settings()
+    if not active_settings.pinecone_api_key:
+        raise RuntimeError("PINECONE_API_KEY is required for Pinecone vector search.")
+    selected_index = index_name or collection_name or active_settings.pinecone_kb_index_name
+    return PineconeVectorStore(
+        index_name=selected_index,
+        embedding=embedding or get_embedding_model(active_settings),
+        pinecone_api_key=active_settings.pinecone_api_key,
     )
 
 
@@ -173,14 +159,15 @@ def ingest_markdown_kb(
     *,
     kb_dir: str | Path | None = None,
     persist_directory: str | Path | None = None,
-    collection_name: str = DEFAULT_COLLECTION_NAME,
+    collection_name: str | None = None,
+    index_name: str | None = None,
     chunk_size: int = 900,
     chunk_overlap: int = 120,
     reset: bool = True,
 ) -> IngestionReport:
     settings = get_settings()
     kb_path = Path(kb_dir) if kb_dir is not None else settings.kb_dir
-    persist_path = Path(persist_directory) if persist_directory is not None else settings.chroma_dir
+    selected_index = index_name or collection_name or settings.pinecone_kb_index_name
 
     source_documents = load_markdown_documents(kb_path)
     if not source_documents:
@@ -192,25 +179,24 @@ def ingest_markdown_kb(
         chunk_overlap=chunk_overlap,
     )
     vectorstore = get_vectorstore(
-        persist_directory=persist_path,
-        collection_name=collection_name,
+        persist_directory=persist_directory,
+        index_name=selected_index,
     )
 
     if reset:
         try:
-            vectorstore.delete_collection()
+            vectorstore.delete(delete_all=True)
         except Exception:
-            logger.debug("Collection %s did not exist before ingest", collection_name)
+            logger.debug("Index %s was empty before ingest", selected_index)
         vectorstore = get_vectorstore(
-            persist_directory=persist_path,
-            collection_name=collection_name,
+            persist_directory=persist_directory,
+            index_name=selected_index,
         )
 
     vectorstore.add_documents(chunks, ids=[str(chunk.metadata["chunk_id"]) for chunk in chunks])
     return IngestionReport(
         kb_dir=kb_path,
-        persist_directory=persist_path,
-        collection_name=collection_name,
+        index_name=selected_index,
         source_documents=len(source_documents),
         chunks=len(chunks),
         chunk_size=chunk_size,

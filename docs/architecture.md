@@ -1,15 +1,15 @@
 # Architecture
 
-Capstone ITS v2 is a FastAPI application with a user-facing chat triage agent and an admin dashboard. The backend uses LangChain for model/retrieval calls, LangGraph for the stateful workflow, Pydantic for every LLM structured output, SQLite for tickets and graph checkpoints, and local ChromaDB for the Markdown knowledge base.
+Capstone ITS v2 is a FastAPI application with a user-facing chat triage agent and an admin dashboard. The backend uses LangChain for model/retrieval calls, LangGraph for the stateful workflow, Pydantic for every LLM structured output, SQLite for tickets and graph checkpoints, and Pinecone for vector search.
 
 ## Runtime Components
 
 - **FastAPI** serves the chat page, admin dashboard, static assets, and JSON APIs.
 - **LangGraph** owns the multi-turn workflow and persists thread state with `langgraph-checkpoint-sqlite`.
-- **LangChain** wraps the configured chat model's `.with_structured_output()`, Chroma retrieval, BM25 keyword retrieval, and FlashRank reranking.
+- **LangChain** wraps the configured chat model, Pinecone retrieval, and FlashRank reranking.
 - **Pydantic** validates graph state objects, ticket metadata, guardrail results, classifications, requirement assessments, and final answer validation.
 - **SQLite + SQLAlchemy** stores tickets, ticket messages, KB links, duplicate relations, and LangGraph checkpoints.
-- **ChromaDB** stores local vector embeddings for curated Markdown files under `kb/`.
+- **Pinecone** stores KB vectors in `its-knowledge-base` and ticket vectors in `its-tickets`.
 
 ## API Surface
 
@@ -28,6 +28,7 @@ Defined in `app/db.py`:
 - `ticket_kb_links`: linked KB articles with relevance and clearance metadata.
 - `duplicate_ticket_links`: ticket-to-ticket duplicate relationship candidates.
 - LangGraph checkpoint tables are managed by `SqliteSaver` in `data/langgraph_checkpoints.sqlite`.
+- Ticket vector documents are stored in the Pinecone index `its-tickets`; SQLite remains the source of truth.
 
 ## Pydantic State
 
@@ -73,10 +74,9 @@ Defined in `app/rag.py` and `scripts/ingest_kb.py`:
 1. Load Markdown files from `kb/` with LangChain `DirectoryLoader` and `TextLoader`.
 2. Parse front matter only to normalize metadata: `category`, `clearance` or `clearance_level`, `app_name`, and `environment`.
 3. Split content with LangChain `MarkdownHeaderTextSplitter` and `MarkdownTextSplitter`.
-4. Store chunks in local ChromaDB using the embedding model returned by `app.llm.get_embedding_model()`.
-5. At query time, build a Chroma filter from user clearance, category, app, and environment before similarity search.
-6. Combine Chroma vector retrieval with `BM25Retriever` keyword retrieval using reciprocal-rank fusion.
-7. Rerank with LangChain's `FlashrankRerank`.
+4. Store chunks in Pinecone index `its-knowledge-base` using the embedding model returned by `app.llm.get_embedding_model()`.
+5. At query time, build a Pinecone metadata filter from user clearance, category, app, and environment before similarity search.
+6. Rerank with LangChain's `FlashrankRerank`.
 
 ## Runbook
 
@@ -84,6 +84,7 @@ Defined in `app/rag.py` and `scripts/ingest_kb.py`:
 uv sync
 cp .env.example .env
 uv run python scripts/ingest_kb.py
+uv run python scripts/ingest_tickets.py
 uv run uvicorn app.main:app --reload
 ```
 
@@ -92,3 +93,4 @@ Model construction is centralized in `app/llm.py`.
 - OpenAI chat and embeddings: `LLM_PROVIDER=openai`, `EMBEDDING_PROVIDER=openai`.
 - Ollama chat: `LLM_PROVIDER=ollama`, `OLLAMA_MODEL=...`, `OLLAMA_BASE_URL=...`.
 - Hugging Face embeddings: `EMBEDDING_PROVIDER=huggingface` after installing the `huggingface` extra.
+- Pinecone: set `PINECONE_API_KEY`; defaults are `PINECONE_KB_INDEX_NAME=its-knowledge-base` and `PINECONE_TICKET_INDEX_NAME=its-tickets`.
