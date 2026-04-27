@@ -266,6 +266,8 @@ class TicketCreate(AppModel):
     conversation: list[ChatMessage] = Field(default_factory=list, max_length=200)
     guardrail: GuardrailDecision | None = None
     raw_context: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class TicketRead(AppModel):

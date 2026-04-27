@@ -14,6 +14,11 @@ class Settings(BaseSettings):
         default="text-embedding-3-small",
         alias="OPENAI_EMBEDDING_MODEL",
     )
+    openai_embedding_dimensions: int | None = Field(
+        default=None,
+        alias="OPENAI_EMBEDDING_DIMENSIONS",
+        ge=1,
+    )
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
     llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE", ge=0.0, le=2.0)
     ollama_model: str = Field(default="llama3.1", alias="OLLAMA_MODEL")
@@ -54,6 +59,13 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL cannot be empty")
         if "://" not in value:
             raise ValueError("DATABASE_URL must be a SQLAlchemy URL")
+        return value
+
+    @field_validator("openai_embedding_dimensions", mode="before")
+    @classmethod
+    def blank_embedding_dimensions_to_none(cls, value: object) -> object:
+        if value == "":
+            return None
         return value
 
     @property

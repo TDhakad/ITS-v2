@@ -87,7 +87,12 @@ def index_ticket(ticket: TicketRead) -> bool:
         return False
 
 
-def index_tickets(tickets: Iterable[TicketRead], *, reset: bool = False) -> int:
+def index_tickets(
+    tickets: Iterable[TicketRead],
+    *,
+    reset: bool = False,
+    batch_size: int = 100,
+) -> int:
     vectorstore = get_ticket_vectorstore()
     if reset:
         try:
@@ -96,9 +101,21 @@ def index_tickets(tickets: Iterable[TicketRead], *, reset: bool = False) -> int:
             logger.debug("Ticket vector index was empty before reset")
         vectorstore = get_ticket_vectorstore()
 
-    documents = [ticket_to_document(ticket) for ticket in tickets]
-    if not documents:
-        return 0
+    total = 0
+    documents: list[Document] = []
+    selected_batch_size = max(batch_size, 1)
+    for ticket in tickets:
+        documents.append(ticket_to_document(ticket))
+        if len(documents) >= selected_batch_size:
+            total += _add_ticket_documents(vectorstore, documents)
+            documents = []
+
+    if documents:
+        total += _add_ticket_documents(vectorstore, documents)
+    return total
+
+
+def _add_ticket_documents(vectorstore, documents: list[Document]) -> int:
     vectorstore.add_documents(
         documents,
         ids=[str(document.metadata["ticket_vector_id"]) for document in documents],
@@ -244,6 +261,11 @@ def _ticket_content(ticket: TicketRead) -> str:
         parts.append(f"Linked KB: {_linked_kb_text(ticket.resolution.linked_kb_articles)}")
     if ticket.resolution.suggested_fixes:
         parts.append(f"Suggested fixes: {'; '.join(ticket.resolution.suggested_fixes)}")
+    if ticket.raw_context:
+        embedding_text = ticket.raw_context.get("embedding_text")
+        if embedding_text:
+            parts.append(f"Search text: {_truncate(str(embedding_text), MAX_MESSAGE_CHARS)}")
+            return "\n".join(part for part in parts if part)
     if ticket.conversation:
         parts.append("Conversation:")
         parts.extend(_message_lines(ticket.conversation))

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import importlib
 import logging
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -70,6 +71,11 @@ app = FastAPI(
 )
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+FRONTEND_INDEX = FRONTEND_DIST / "index.html"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+if FRONTEND_ASSETS.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
 _db_initialized = False
 logger = logging.getLogger(__name__)
 
@@ -160,25 +166,44 @@ def swagger_ui(
 # ── Pages ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-def chat_page(request: Request) -> HTMLResponse:
+def chat_page(request: Request) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "chat.html")
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request) -> HTMLResponse:
+def login_page(request: Request) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "login.html")
 
 
 @app.get("/register", response_class=HTMLResponse)
-def register_page(request: Request) -> HTMLResponse:
+def register_page(request: Request) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "register.html")
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(
     request: Request,
-    current_user: AdminUser,
-) -> HTMLResponse:
+    current_user: OptionalUser,
+) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to perform this action.",
+        )
     return templates.TemplateResponse(request, "admin.html")
 
 
@@ -577,6 +602,18 @@ def get_tags(db: DBSession) -> dict[str, Any]:
     tags = list_tags(db)
     return {"tags": [{"id": t.id, "name": t.name, "slug": t.slug, "color": t.color}
                      for t in tags]}
+
+
+@app.get("/{frontend_path:path}", include_in_schema=False)
+def frontend_fallback(frontend_path: str) -> FileResponse:
+    """Serve React client routes from the production build when available."""
+    blocked_prefixes = ("api/", "auth/", "static/", "assets/")
+    blocked_exact = {"api", "auth", "static", "assets", "docs", "openapi.json"}
+    if frontend_path in blocked_exact or frontend_path.startswith(blocked_prefixes):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if not FRONTEND_INDEX.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return FileResponse(FRONTEND_INDEX)
 
 
 def _result_value(result: Any, key: str, default: Any = None) -> Any:

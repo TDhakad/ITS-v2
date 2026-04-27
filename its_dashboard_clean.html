@@ -1,0 +1,504 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:var(--font-sans);}
+.app{height:660px;display:flex;flex-direction:column;background:var(--color-background-tertiary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden;}
+
+/* NAV */
+.topnav{height:46px;background:var(--color-background-primary);border-bottom:0.5px solid var(--color-border-tertiary);display:flex;align-items:center;padding:0 20px;gap:0;flex-shrink:0;}
+.brand{display:flex;align-items:center;gap:9px;margin-right:28px;}
+.brand-icon{width:28px;height:28px;border-radius:7px;background:#1746c7;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:500;color:#fff;}
+.brand-name{font-size:13px;font-weight:500;color:var(--color-text-primary);}
+.tabs{display:flex;align-items:stretch;height:100%;gap:0;}
+.tab{display:flex;align-items:center;gap:6px;padding:0 15px;font-size:12px;color:var(--color-text-secondary);cursor:pointer;border-bottom:2px solid transparent;user-select:none;}
+.tab:hover{color:var(--color-text-primary);}
+.tab.active{color:#1746c7;border-bottom-color:#1746c7;font-weight:500;}
+.nav-end{margin-left:auto;display:flex;align-items:center;gap:8px;}
+.n-btn{padding:5px 12px;border-radius:6px;border:0.5px solid var(--color-border-secondary);background:transparent;font-size:12px;color:var(--color-text-secondary);cursor:pointer;font-family:var(--font-sans);}
+.n-btn.p{background:#1746c7;border-color:#1746c7;color:#fff;}
+.av{width:26px;height:26px;border-radius:50%;background:#1746c7;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:500;color:#fff;cursor:pointer;}
+
+/* PAGES */
+.page{display:none;flex:1;overflow:hidden;}
+.page.on{display:flex;}
+
+/* ===== DASHBOARD ===== */
+.db-wrap{display:flex;width:100%;overflow:hidden;}
+.db-side{width:196px;background:var(--color-background-primary);border-right:0.5px solid var(--color-border-tertiary);display:flex;flex-direction:column;flex-shrink:0;}
+.side-nav{padding:10px 8px;flex:1;}
+.side-sec{font-size:9px;color:var(--color-text-tertiary);letter-spacing:.08em;text-transform:uppercase;padding:0 8px;margin:12px 0 3px;}
+.side-item{display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12px;color:var(--color-text-secondary);}
+.side-item:hover{background:var(--color-background-secondary);}
+.side-item.on{background:#EBF1FD;color:#1746c7;font-weight:500;}
+.side-count{margin-left:auto;font-size:10px;padding:1px 5px;border-radius:8px;background:var(--color-background-secondary);color:var(--color-text-tertiary);}
+.side-item.on .side-count{background:#d0defa;color:#1746c7;}
+.side-foot{padding:10px 12px;border-top:0.5px solid var(--color-border-tertiary);display:flex;align-items:center;gap:8px;}
+.foot-av{width:24px;height:24px;border-radius:50%;background:#1746c7;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:500;color:#fff;flex-shrink:0;}
+.foot-name{font-size:11px;font-weight:500;color:var(--color-text-primary);}
+.foot-role{font-size:10px;color:var(--color-text-tertiary);}
+.db-main{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--color-background-secondary);}
+.db-header{padding:18px 24px 14px;background:var(--color-background-primary);border-bottom:0.5px solid var(--color-border-tertiary);}
+.db-h-top{display:flex;align-items:center;margin-bottom:14px;}
+.db-h-title{font-size:16px;font-weight:500;color:var(--color-text-primary);flex:1;}
+.db-search{display:flex;align-items:center;gap:7px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);border-radius:7px;padding:6px 11px;width:220px;}
+.db-search input{flex:1;background:transparent;border:none;outline:none;font-size:12px;color:var(--color-text-primary);font-family:var(--font-sans);}
+.db-search input::placeholder{color:var(--color-text-tertiary);}
+.db-cols{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+.db-col-head{font-size:10px;font-weight:500;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.07em;display:flex;align-items:center;gap:5px;}
+.col-count{font-size:10px;padding:1px 6px;border-radius:8px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);color:var(--color-text-tertiary);}
+.db-body{flex:1;overflow-y:auto;padding:16px 24px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-content:start;}
+.col-tickets{display:flex;flex-direction:column;gap:8px;}
+.t-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:11px 13px;cursor:pointer;transition:border-color .15s;}
+.t-card:hover{border-color:#1746c7;}
+.tc-title{font-size:12px;font-weight:500;color:var(--color-text-primary);line-height:1.45;margin-bottom:8px;}
+.tc-foot{display:flex;align-items:center;gap:6px;}
+.prio{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--color-text-tertiary);}
+.pdot{width:6px;height:6px;border-radius:50%;}
+.ph{background:#e24b4a;}.pm{background:#EF9F27;}.pl{background:#639922;}
+.tc-time{margin-left:auto;font-size:10px;color:var(--color-text-tertiary);}
+.tc-cat{font-size:10px;padding:2px 7px;border-radius:10px;background:var(--color-background-secondary);color:var(--color-text-secondary);border:0.5px solid var(--color-border-tertiary);}
+
+/* ===== TICKET DETAIL ===== */
+.td-wrap{display:flex;width:100%;overflow:hidden;position:relative;}
+.td-main{flex:1;display:flex;flex-direction:column;overflow:hidden;transition:margin-right .25s ease;}
+.td-main.shifted{margin-right:280px;}
+.td-top{padding:12px 20px;background:var(--color-background-primary);border-bottom:0.5px solid var(--color-border-tertiary);display:flex;align-items:center;gap:10px;flex-shrink:0;}
+.back-btn{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--color-text-secondary);cursor:pointer;padding:4px 8px;border-radius:5px;}
+.back-btn:hover{background:var(--color-background-secondary);}
+.td-breadcrumb{font-size:12px;color:var(--color-text-tertiary);}
+.td-breadcrumb span{color:var(--color-text-primary);font-weight:500;}
+.td-actions{margin-left:auto;display:flex;align-items:center;gap:6px;}
+.ai-toggle{display:flex;align-items:center;gap:6px;padding:5px 11px;border-radius:6px;border:0.5px solid var(--color-border-secondary);background:transparent;font-size:12px;color:var(--color-text-secondary);cursor:pointer;font-family:var(--font-sans);}
+.ai-toggle.on{background:#EBF1FD;color:#1746c7;border-color:#b3c8f5;}
+.ai-toggle-dot{width:6px;height:6px;border-radius:50%;background:#ccc;flex-shrink:0;}
+.ai-toggle.on .ai-toggle-dot{background:#2a7d4f;}
+.status-sel{font-size:12px;padding:5px 10px;border-radius:6px;border:0.5px solid var(--color-border-secondary);color:var(--color-text-secondary);background:var(--color-background-primary);font-family:var(--font-sans);cursor:pointer;}
+.td-body{flex:1;overflow-y:auto;padding:24px 28px;display:flex;flex-direction:column;gap:16px;}
+.td-title-block{margin-bottom:4px;}
+.td-h{font-size:17px;font-weight:500;color:var(--color-text-primary);line-height:1.4;margin-bottom:10px;}
+.td-meta{display:flex;gap:24px;flex-wrap:wrap;}
+.meta-field{display:flex;flex-direction:column;gap:2px;}
+.meta-label{font-size:10px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.06em;}
+.meta-val{font-size:12px;font-weight:500;color:var(--color-text-primary);display:flex;align-items:center;gap:4px;}
+.divider{height:0.5px;background:var(--color-border-tertiary);}
+.sec-label{font-size:10px;font-weight:500;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;}
+.desc-p{font-size:13px;color:var(--color-text-secondary);line-height:1.65;}
+.convo{display:flex;flex-direction:column;gap:10px;}
+.cmsg{padding:10px 13px;border-radius:8px;}
+.cmsg-u{background:var(--color-background-secondary);}
+.cmsg-a{background:#EBF1FD;}
+.cmsg-who{font-size:10px;color:var(--color-text-tertiary);margin-bottom:4px;font-weight:500;text-transform:uppercase;letter-spacing:.04em;}
+.cmsg-a .cmsg-who{color:#1746c7;}
+.cmsg-text{font-size:12px;color:var(--color-text-primary);line-height:1.55;}
+.reply-area{background:var(--color-background-primary);border-top:0.5px solid var(--color-border-tertiary);padding:12px 20px;display:flex;gap:8px;align-items:center;flex-shrink:0;}
+.reply-in{flex:1;font-size:12px;padding:7px 11px;border-radius:7px;border:0.5px solid var(--color-border-tertiary);background:var(--color-background-secondary);color:var(--color-text-primary);font-family:var(--font-sans);}
+.reply-in::placeholder{color:var(--color-text-tertiary);}
+.reply-send{padding:7px 14px;border-radius:6px;background:#1746c7;border:none;color:#fff;font-size:12px;cursor:pointer;font-family:var(--font-sans);}
+
+/* AI DRAWER */
+.ai-drawer{position:absolute;top:0;right:0;height:100%;width:280px;background:var(--color-background-primary);border-left:0.5px solid var(--color-border-tertiary);display:flex;flex-direction:column;transform:translateX(100%);transition:transform .25s ease;}
+.ai-drawer.open{transform:translateX(0);}
+.ai-dh{padding:12px 14px;border-bottom:0.5px solid var(--color-border-tertiary);display:flex;align-items:center;gap:7px;}
+.ai-dh-dot{width:6px;height:6px;border-radius:50%;background:#2a7d4f;flex-shrink:0;}
+.ai-dh-title{font-size:12px;font-weight:500;color:var(--color-text-primary);flex:1;}
+.ai-close{width:22px;height:22px;border-radius:5px;border:0.5px solid var(--color-border-tertiary);background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--color-text-tertiary);}
+.ai-close:hover{background:var(--color-background-secondary);}
+.ai-db{flex:1;overflow-y:auto;padding:14px;}
+.ai-block{margin-bottom:14px;}
+.ai-bt{font-size:10px;font-weight:500;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px;}
+.ai-bp{font-size:12px;color:var(--color-text-secondary);line-height:1.6;}
+.ai-sep{height:0.5px;background:var(--color-border-tertiary);margin:12px 0;}
+.ai-action-row{display:flex;gap:6px;align-items:flex-start;padding:8px 9px;background:var(--color-background-secondary);border-radius:6px;margin-bottom:6px;border:0.5px solid var(--color-border-tertiary);}
+.ai-action-row:last-child{margin-bottom:0;}
+.ai-icon{width:20px;height:20px;border-radius:4px;background:#EBF1FD;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.ai-action-text{font-size:11px;color:var(--color-text-secondary);line-height:1.45;}
+.tag-row{display:flex;flex-wrap:wrap;gap:5px;}
+.tag{font-size:10px;padding:2px 8px;border-radius:10px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);color:var(--color-text-secondary);}
+.ai-df{padding:10px 14px;border-top:0.5px solid var(--color-border-tertiary);}
+.ai-fin{display:flex;gap:6px;}
+.ai-fin input{flex:1;font-size:11px;padding:6px 9px;border-radius:6px;border:0.5px solid var(--color-border-secondary);background:var(--color-background-secondary);color:var(--color-text-primary);font-family:var(--font-sans);outline:none;}
+.ai-fin input::placeholder{color:var(--color-text-tertiary);}
+.ai-fin button{padding:6px 11px;border-radius:6px;background:#1746c7;border:none;color:#fff;font-size:11px;cursor:pointer;font-family:var(--font-sans);}
+
+/* ===== AI CHAT PAGE ===== */
+.chat-wrap{display:flex;width:100%;overflow:hidden;}
+.chat-hist{width:210px;background:var(--color-background-primary);border-right:0.5px solid var(--color-border-tertiary);display:flex;flex-direction:column;flex-shrink:0;}
+.ch-top{padding:12px 12px 10px;}
+.ch-label{font-size:11px;font-weight:500;color:var(--color-text-primary);margin-bottom:8px;}
+.new-btn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;padding:7px;border-radius:7px;border:0.5px solid var(--color-border-secondary);background:transparent;font-size:12px;color:var(--color-text-secondary);cursor:pointer;font-family:var(--font-sans);}
+.new-btn:hover{background:var(--color-background-secondary);}
+.ch-list{flex:1;overflow-y:auto;padding:4px 8px 8px;}
+.ch-sec{font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:.08em;padding:8px 6px 4px;}
+.ch-item{padding:7px 8px;border-radius:6px;cursor:pointer;margin-bottom:1px;}
+.ch-item:hover{background:var(--color-background-secondary);}
+.ch-item.on{background:#EBF1FD;}
+.ch-item-title{font-size:12px;color:var(--color-text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px;}
+.ch-item.on .ch-item-title{color:#1746c7;font-weight:500;}
+.ch-item-time{font-size:10px;color:var(--color-text-tertiary);}
+.chat-main{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--color-background-secondary);}
+.chat-top{padding:0 20px;height:46px;border-bottom:0.5px solid var(--color-border-tertiary);background:var(--color-background-primary);display:flex;align-items:center;gap:8px;flex-shrink:0;}
+.chat-top-title{font-size:13px;font-weight:500;color:var(--color-text-primary);flex:1;}
+.ctx-pill{display:flex;align-items:center;gap:5px;font-size:11px;padding:4px 10px;border-radius:20px;border:0.5px solid var(--color-border-tertiary);color:var(--color-text-secondary);background:var(--color-background-secondary);}
+.ctx-pill svg{opacity:.5;}
+.msgs{flex:1;overflow-y:auto;padding:28px 32px;display:flex;flex-direction:column;gap:20px;}
+.bubble-row{display:flex;gap:11px;align-items:flex-end;}
+.bubble-row.me{flex-direction:row-reverse;}
+.bav{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:500;flex-shrink:0;}
+.bav.ai{background:#1746c7;color:#fff;}
+.bav.me{background:var(--color-background-primary);color:var(--color-text-secondary);border:0.5px solid var(--color-border-tertiary);}
+.bubble{max-width:66%;padding:11px 15px;border-radius:14px;font-size:13px;line-height:1.6;}
+.bubble.ai{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);color:var(--color-text-primary);border-bottom-left-radius:4px;}
+.bubble.me{background:#1746c7;color:#fff;border-bottom-right-radius:4px;}
+.btime{font-size:10px;margin-top:5px;opacity:.55;}
+.source-row{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;}
+.src{font-size:10px;padding:3px 8px;border-radius:5px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);color:var(--color-text-secondary);cursor:pointer;}
+.src:hover{border-color:#1746c7;color:#1746c7;}
+.suggestions{display:flex;flex-wrap:wrap;gap:6px;padding:0 32px 12px;}
+.sug{font-size:11px;padding:5px 12px;border-radius:20px;border:0.5px solid var(--color-border-secondary);background:var(--color-background-primary);color:var(--color-text-secondary);cursor:pointer;font-family:var(--font-sans);}
+.sug:hover{border-color:#1746c7;color:#1746c7;}
+.chat-input{padding:12px 24px 18px;background:var(--color-background-primary);border-top:0.5px solid var(--color-border-tertiary);flex-shrink:0;}
+.input-box{display:flex;align-items:flex-end;gap:10px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-secondary);border-radius:12px;padding:10px 12px;}
+.input-box:focus-within{border-color:#1746c7;}
+.input-box textarea{flex:1;background:transparent;border:none;outline:none;resize:none;font-size:13px;color:var(--color-text-primary);font-family:var(--font-sans);line-height:1.5;max-height:80px;}
+.input-box textarea::placeholder{color:var(--color-text-tertiary);}
+.send{width:34px;height:34px;border-radius:8px;background:#1746c7;border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;}
+.chat-foot{display:flex;gap:14px;margin-top:7px;padding:0 2px;}
+.cf{font-size:10px;color:var(--color-text-tertiary);display:flex;align-items:center;gap:4px;}
+</style>
+
+<h2 class="sr-only">ITS Admin — three-page app: Dashboard, Ticket Detail, AI Assistant</h2>
+
+<div class="app">
+  <!-- NAV -->
+  <div class="topnav">
+    <div class="brand">
+      <div class="brand-icon">IT</div>
+      <span class="brand-name">Ops Console</span>
+    </div>
+    <div class="tabs">
+      <div class="tab active" id="tab-dash" onclick="go('dash')">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" fill="currentColor"/><rect x="9" y="1" width="6" height="6" rx="1.5" fill="currentColor" opacity=".4"/><rect x="1" y="9" width="6" height="6" rx="1.5" fill="currentColor" opacity=".4"/><rect x="9" y="9" width="6" height="6" rx="1.5" fill="currentColor" opacity=".4"/></svg>
+        Dashboard
+      </div>
+      <div class="tab" id="tab-ai" onclick="go('ai')">
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 013.5 2h9A1.5 1.5 0 0114 3.5v6A1.5 1.5 0 0112.5 11H9l-3 3v-3H3.5A1.5 1.5 0 012 9.5v-6z" stroke="currentColor" stroke-width="1.2"/></svg>
+        AI Assistant
+      </div>
+    </div>
+    <div class="nav-end">
+      <button class="n-btn p">+ New ticket</button>
+      <div class="av">AK</div>
+    </div>
+  </div>
+
+  <!-- DASHBOARD -->
+  <div class="page on" id="page-dash">
+    <div class="db-wrap">
+      <div class="db-side">
+        <div class="side-nav">
+          <div class="side-sec">Workspace</div>
+          <div class="side-item on">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" fill="currentColor"/><rect x="9" y="1" width="6" height="6" rx="1.5" fill="currentColor" opacity=".3"/><rect x="1" y="9" width="6" height="6" rx="1.5" fill="currentColor" opacity=".3"/><rect x="9" y="9" width="6" height="6" rx="1.5" fill="currentColor" opacity=".3"/></svg>
+            All tickets<span class="side-count">4</span>
+          </div>
+          <div class="side-item">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor"/><path d="M8 5v3.5l2 2" stroke="currentColor" stroke-linecap="round"/></svg>
+            My queue<span class="side-count">2</span>
+          </div>
+          <div class="side-item">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M2 12l3.5-4 3 2.5L12 5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+            Reports
+          </div>
+          <div class="side-sec" style="margin-top:12px;">Categories</div>
+          <div class="side-item">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor"/></svg>
+            Infrastructure<span class="side-count">3</span>
+          </div>
+          <div class="side-item">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="3" y="2" width="10" height="12" rx="1.5" stroke="currentColor"/></svg>
+            Access mgmt<span class="side-count">1</span>
+          </div>
+          <div class="side-item">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="6" r="3" stroke="currentColor"/><path d="M2 14c0-3 2.7-5 6-5s6 2 6 5" stroke="currentColor" stroke-linecap="round"/></svg>
+            Onboarding
+          </div>
+        </div>
+        <div class="side-foot">
+          <div class="foot-av">AK</div>
+          <div><div class="foot-name">Alex Kim</div><div class="foot-role">IT Admin</div></div>
+        </div>
+      </div>
+      <div class="db-main">
+        <div class="db-header">
+          <div class="db-h-top">
+            <span class="db-h-title">All tickets</span>
+            <div class="db-search">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" style="opacity:.4;flex-shrink:0;"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.5"/><path d="M11 11l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              <input placeholder="Search tickets…" />
+            </div>
+          </div>
+          <div class="db-cols" style="padding-bottom:2px;">
+            <div class="db-col-head"><div class="pdot pm"></div>Open<span class="col-count">3</span></div>
+            <div class="db-col-head"><div class="pdot" style="background:#aaa;"></div>Pending<span class="col-count">1</span></div>
+            <div class="db-col-head"><div class="pdot pl"></div>Resolved<span class="col-count">0</span></div>
+          </div>
+        </div>
+        <div class="db-body">
+          <div class="col-tickets">
+            <div class="t-card" onclick="go('ticket')">
+              <div class="tc-title">AWS Staging access request — new Engineering hire</div>
+              <div class="tc-foot">
+                <div class="prio"><div class="pdot pm"></div>Medium</div>
+                <span class="tc-cat">Infra</span>
+                <span class="tc-time">4:24 AM</span>
+              </div>
+            </div>
+            <div class="t-card" onclick="go('ticket')">
+              <div class="tc-title">User requesting access to JFrog artifact registry</div>
+              <div class="tc-foot">
+                <div class="prio"><div class="pdot pm"></div>Medium</div>
+                <span class="tc-cat">Access</span>
+                <span class="tc-time">1:53 AM</span>
+              </div>
+            </div>
+            <div class="t-card" onclick="go('ticket')">
+              <div class="tc-title">VPN certificate renewal — production gateway</div>
+              <div class="tc-foot">
+                <div class="prio"><div class="pdot ph"></div>High</div>
+                <span class="tc-cat">Infra</span>
+                <span class="tc-time">Yesterday</span>
+              </div>
+            </div>
+          </div>
+          <div class="col-tickets">
+            <div class="t-card" onclick="go('ticket')">
+              <div class="tc-title">JFrog read-only access — Infra team member (Tanmay)</div>
+              <div class="tc-foot">
+                <div class="prio"><div class="pdot pm"></div>Medium</div>
+                <span class="tc-cat">Access</span>
+                <span class="tc-time">1:49 AM</span>
+              </div>
+            </div>
+          </div>
+          <div class="col-tickets"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TICKET DETAIL -->
+  <div class="page" id="page-ticket">
+    <div class="td-wrap">
+      <div class="td-main" id="td-main">
+        <div class="td-top">
+          <div class="back-btn" onclick="go('dash')">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Back
+          </div>
+          <span class="td-breadcrumb">All tickets · <span>#4 AWS Staging Access</span></span>
+          <div class="td-actions">
+            <button class="ai-toggle" id="ai-toggle-btn" onclick="toggleAI()">
+              <div class="ai-toggle-dot" id="ai-toggle-dot"></div>
+              AI Insights
+            </button>
+            <select class="status-sel"><option>Open</option><option>Pending</option><option>Resolved</option></select>
+            <button class="n-btn p" style="font-size:11px;padding:5px 10px;">Assign</button>
+          </div>
+        </div>
+        <div class="td-body">
+          <div class="td-title-block">
+            <div class="td-h">AWS Staging Access Request for new hire in Engineering department</div>
+            <div class="td-meta">
+              <div class="meta-field"><div class="meta-label">Requester</div><div class="meta-val">anonymous · #4</div></div>
+              <div class="meta-field"><div class="meta-label">Priority</div><div class="meta-val"><div class="pdot pm"></div>Medium</div></div>
+              <div class="meta-field"><div class="meta-label">Category</div><div class="meta-val">Infra · AWS</div></div>
+              <div class="meta-field"><div class="meta-label">Updated</div><div class="meta-val">Apr 26, 4:24 AM</div></div>
+            </div>
+          </div>
+          <div class="divider"></div>
+          <div>
+            <div class="sec-label">Description</div>
+            <p class="desc-p">AWS Staging environment access is required for a new hire joining the Engineering department. They will need standard developer permissions scoped to staging only, with no access to production resources.</p>
+          </div>
+          <div class="divider"></div>
+          <div>
+            <div class="sec-label">Conversation</div>
+            <div class="convo">
+              <div class="cmsg cmsg-u"><div class="cmsg-who">User · Apr 26, 4:24 AM</div><div class="cmsg-text">Could you help me with onboarding docs for AWS staging access?</div></div>
+              <div class="cmsg cmsg-a"><div class="cmsg-who">Assistant · Apr 26, 4:24 AM</div><div class="cmsg-text">I can certainly help with that. I'll need the new hire's email and their team lead to verify the access scope before provisioning.</div></div>
+              <div class="cmsg cmsg-u"><div class="cmsg-who">User · Apr 26, 4:31 AM</div><div class="cmsg-text">Their email is rahul.v@company.com. Team lead is Tanmay.</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="reply-area">
+          <input class="reply-in" placeholder="Write a reply…" />
+          <button class="reply-send">Send</button>
+        </div>
+      </div>
+      <!-- AI DRAWER -->
+      <div class="ai-drawer" id="ai-drawer">
+        <div class="ai-dh">
+          <div class="ai-dh-dot"></div>
+          <span class="ai-dh-title">AI insights</span>
+          <button class="ai-close" onclick="toggleAI()">
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M3 3l10 10M13 3L3 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <div class="ai-db">
+          <div class="ai-block">
+            <div class="ai-bt">Summary</div>
+            <div class="ai-bp">New Engineering hire needs AWS Staging access. Requester identity is currently unverified — confirm via HR before provisioning.</div>
+          </div>
+          <div class="ai-sep"></div>
+          <div class="ai-block">
+            <div class="ai-bt">Recommended actions</div>
+            <div class="ai-action-row">
+              <div class="ai-icon"><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="6" r="3" stroke="#1746c7"/><path d="M2 14c0-3 2.7-4 6-4s6 1 6 4" stroke="#1746c7" stroke-linecap="round"/></svg></div>
+              <div class="ai-action-text">Verify rahul.v@company.com in HR directory against this ticket</div>
+            </div>
+            <div class="ai-action-row">
+              <div class="ai-icon"><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><rect x="2" y="4" width="12" height="9" rx="1.5" stroke="#1746c7"/><path d="M5 4V3a3 3 0 016 0v1" stroke="#1746c7"/></svg></div>
+              <div class="ai-action-text">Provision staging-only IAM role with least privilege</div>
+            </div>
+            <div class="ai-action-row">
+              <div class="ai-icon"><svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M8 3v10" stroke="#1746c7" stroke-linecap="round"/></svg></div>
+              <div class="ai-action-text">Log access grant in audit trail and notify Tanmay</div>
+            </div>
+          </div>
+          <div class="ai-sep"></div>
+          <div class="ai-block">
+            <div class="ai-bt">Signals</div>
+            <div class="tag-row"><span class="tag">Infra</span><span class="tag">AWS</span><span class="tag">Staging</span><span class="tag">Onboarding</span><span class="tag">Unverified</span></div>
+          </div>
+          <div class="ai-sep"></div>
+          <div class="ai-block">
+            <div class="ai-bt">Similar tickets resolved</div>
+            <div class="ai-bp">3 matching tickets — median resolution 1.8h. Typical action: read-only IAM role provisioned, team lead notified.</div>
+          </div>
+          <div class="ai-sep"></div>
+          <div class="ai-block">
+            <div class="ai-bt">Suggested assignee</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <div style="width:22px;height:22px;border-radius:50%;background:#EBF1FD;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:500;color:#1746c7;">TM</div>
+              <span style="font-size:11px;color:var(--color-text-secondary);">Tanmay M. · Infra lead</span>
+            </div>
+          </div>
+        </div>
+        <div class="ai-df">
+          <div class="ai-fin">
+            <input placeholder="Ask about this ticket…" />
+            <button>Ask</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI ASSISTANT -->
+  <div class="page" id="page-ai">
+    <div class="chat-wrap">
+      <div class="chat-hist">
+        <div class="ch-top">
+          <div class="ch-label">Conversations</div>
+          <button class="new-btn">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            New chat
+          </button>
+        </div>
+        <div class="ch-list">
+          <div class="ch-sec">Today</div>
+          <div class="ch-item on"><div class="ch-item-title">High priority ticket trends</div><div class="ch-item-time">Just now</div></div>
+          <div class="ch-item"><div class="ch-item-title">AWS access provisioning SOP</div><div class="ch-item-time">2h ago</div></div>
+          <div class="ch-item"><div class="ch-item-title">JFrog permission levels explained</div><div class="ch-item-time">3h ago</div></div>
+          <div class="ch-sec">Yesterday</div>
+          <div class="ch-item"><div class="ch-item-title">SLA breach risk analysis</div><div class="ch-item-time">Apr 25</div></div>
+          <div class="ch-item"><div class="ch-item-title">Onboarding access checklist</div><div class="ch-item-time">Apr 25</div></div>
+          <div class="ch-item"><div class="ch-item-title">VPN cert renewal runbook</div><div class="ch-item-time">Apr 25</div></div>
+        </div>
+      </div>
+      <div class="chat-main">
+        <div class="chat-top">
+          <span class="chat-top-title">AI Assistant</span>
+          <div class="ctx-pill">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><rect x="1" y="1" width="6" height="6" rx="1.5" fill="currentColor"/><rect x="9" y="1" width="6" height="6" rx="1.5" fill="currentColor" opacity=".3"/><rect x="1" y="9" width="6" height="6" rx="1.5" fill="currentColor" opacity=".3"/><rect x="9" y="9" width="6" height="6" rx="1.5" fill="currentColor" opacity=".3"/></svg>
+            All tickets in context
+          </div>
+        </div>
+        <div class="msgs">
+          <div class="bubble-row">
+            <div class="bav ai">AI</div>
+            <div class="bubble ai">
+              Hi Alex — I have full context across all open tickets, team activity, and your infrastructure runbooks. Ask me anything.
+              <div class="btime">9:00 AM</div>
+            </div>
+          </div>
+          <div class="bubble-row me">
+            <div class="bav me">AK</div>
+            <div class="bubble me">
+              How many high priority tickets were created this month?
+              <div class="btime">9:01 AM</div>
+            </div>
+          </div>
+          <div class="bubble-row">
+            <div class="bav ai">AI</div>
+            <div class="bubble ai">
+              This month you've had <strong>3 high priority tickets</strong> — down from 7 in March. One is currently open (VPN cert renewal). The other two were resolved within SLA with an average resolution time of 2.1h.
+              <div class="source-row">
+                <div class="src">Ticket #1 · VPN renewal</div>
+                <div class="src">Ticket #7 · DB failover</div>
+                <div class="src">Ticket #12 · prod deploy</div>
+              </div>
+              <div class="btime">9:01 AM</div>
+            </div>
+          </div>
+        </div>
+        <div class="suggestions">
+          <button class="sug">Which tickets are at SLA risk?</button>
+          <button class="sug">Summarize open access requests</button>
+          <button class="sug">Draft a reply for ticket #4</button>
+          <button class="sug">Show onboarding gaps</button>
+        </div>
+        <div class="chat-input">
+          <div class="input-box">
+            <textarea rows="1" placeholder="Ask anything about your tickets, team, or infrastructure…"></textarea>
+            <button class="send">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 8l12-6-6 12V8H2z" fill="white"/></svg>
+            </button>
+          </div>
+          <div class="chat-foot">
+            <span class="cf"><svg width="9" height="9" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor"/></svg>References live ticket data</span>
+            <span class="cf"><svg width="9" height="9" viewBox="0 0 16 16" fill="none"><rect x="3" y="2" width="10" height="12" rx="1.5" stroke="currentColor"/></svg>Reads runbooks</span>
+            <span class="cf"><svg width="9" height="9" viewBox="0 0 16 16" fill="none"><path d="M2 4h12M2 8h8" stroke="currentColor" stroke-linecap="round"/></svg>Can draft replies</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+var aiOpen = false;
+function go(p){
+  document.querySelectorAll('.page').forEach(function(el){el.classList.remove('on');});
+  document.querySelectorAll('.tab').forEach(function(el){el.classList.remove('active');});
+  document.getElementById('page-'+p).classList.add('on');
+  var t = document.getElementById('tab-'+p);
+  if(t) t.classList.add('active');
+  if(p==='ticket' && aiOpen){ openAI(); }
+}
+function openAI(){
+  document.getElementById('ai-drawer').classList.add('open');
+  document.getElementById('td-main').classList.add('shifted');
+  document.getElementById('ai-toggle-btn').classList.add('on');
+  document.getElementById('ai-toggle-dot').style.background='#2a7d4f';
+  aiOpen=true;
+}
+function closeAI(){
+  document.getElementById('ai-drawer').classList.remove('open');
+  document.getElementById('td-main').classList.remove('shifted');
+  document.getElementById('ai-toggle-btn').classList.remove('on');
+  document.getElementById('ai-toggle-dot').style.background='#ccc';
+  aiOpen=false;
+}
+function toggleAI(){ aiOpen ? closeAI() : openAI(); }
+</script>

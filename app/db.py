@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -435,9 +435,43 @@ def _ticket_to_read(record: TicketRecord) -> TicketRead:
     )
 
 
-def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
+def create_ticket(db: Session, ticket: TicketCreate, *, index_vector: bool = True) -> TicketRead:
+    record = _add_ticket_record(db, ticket)
+    db.commit()
+    ticket_read = get_ticket(db, record.id)
+    if ticket_read is None:
+        raise RuntimeError(f"Created ticket {record.id} could not be reloaded")
+    if index_vector:
+        _index_ticket_vector(ticket_read)
+    return ticket_read
+
+
+def create_tickets(
+    db: Session,
+    tickets: Sequence[TicketCreate],
+    *,
+    index_vectors: bool = True,
+    vector_batch_size: int = 100,
+) -> list[TicketRead]:
+    records = [_add_ticket_record(db, ticket) for ticket in tickets]
+    db.commit()
+    ticket_reads = get_tickets_by_ids(db, [record.id for record in records])
+    if index_vectors:
+        _index_ticket_vectors(ticket_reads, batch_size=vector_batch_size)
+    return ticket_reads
+
+
+def _add_ticket_record(db: Session, ticket: TicketCreate) -> TicketRecord:
     intelligence = ticket.intelligence.model_dump(mode="json")
     resolution = ticket.resolution.model_dump(mode="json")
+    timestamp_fields: dict[str, datetime] = {}
+    if ticket.created_at:
+        timestamp_fields["created_at"] = ticket.created_at
+    if ticket.updated_at:
+        timestamp_fields["updated_at"] = ticket.updated_at
+    elif ticket.created_at:
+        timestamp_fields["updated_at"] = ticket.created_at
+
     record = TicketRecord(
         status=ticket.status.value,
         user_id=ticket.user_id,
@@ -456,6 +490,7 @@ def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
         # ticket_messages is authoritative; the JSON column remains only for legacy DBs.
         conversation=[],
         raw_context=ticket.raw_context,
+        **timestamp_fields,
     )
     db.add(record)
     db.flush()
@@ -499,11 +534,7 @@ def create_ticket(db: Session, ticket: TicketCreate) -> TicketRead:
         for tag in tags:
             db.add(TicketTagRecord(ticket_id=record.id, tag_id=tag.id))
 
-    db.commit()
-    db.refresh(record)
-    ticket_read = _ticket_to_read(record)
-    _index_ticket_vector(ticket_read)
-    return ticket_read
+    return record
 
 
 def get_ticket(db: Session, ticket_id: int) -> TicketRead | None:
@@ -513,6 +544,18 @@ def get_ticket(db: Session, ticket_id: int) -> TicketRead | None:
         .where(TicketRecord.id == ticket_id)
     ).first()
     return _ticket_to_read(record) if record else None
+
+
+def get_tickets_by_ids(db: Session, ticket_ids: Sequence[int]) -> list[TicketRead]:
+    if not ticket_ids:
+        return []
+    records = db.scalars(
+        select(TicketRecord)
+        .options(*_ticket_read_options())
+        .where(TicketRecord.id.in_(ticket_ids))
+    ).unique().all()
+    by_id = {record.id: _ticket_to_read(record) for record in records}
+    return [by_id[ticket_id] for ticket_id in ticket_ids if ticket_id in by_id]
 
 
 def list_tickets(
@@ -737,6 +780,17 @@ def _index_ticket_vector(ticket: TicketRead) -> None:
         index_ticket(ticket)
     except Exception as exc:
         logger.warning("Ticket vector indexing failed for ticket %s: %s", ticket.id, exc)
+
+
+def _index_ticket_vectors(tickets: Sequence[TicketRead], *, batch_size: int = 100) -> None:
+    if not tickets:
+        return
+    try:
+        from app.ticket_vector import index_tickets
+
+        index_tickets(tickets, reset=False, batch_size=batch_size)
+    except Exception as exc:
+        logger.warning("Ticket vector batch indexing failed for %s tickets: %s", len(tickets), exc)
 
 
 def _search_ticket_vectors(
