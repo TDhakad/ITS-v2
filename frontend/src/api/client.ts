@@ -5,6 +5,7 @@ import type {
   ChatThreadsResponse,
   CreateTicketPayload,
   CreateTicketResponse,
+  ProjectSummary,
   Ticket,
   TicketInsight
 } from "../types";
@@ -97,7 +98,12 @@ export const api = {
     });
   },
 
-  listTickets: (limit = 100) => request<{ tickets: Ticket[] }>(`/api/tickets?limit=${limit}`),
+  listTickets: (limit = 100, projectId?: number | null) =>
+    request<{ tickets: Ticket[] }>(
+      `/api/tickets?limit=${limit}${projectId !== undefined && projectId !== null ? `&project_id=${projectId}` : ""}`
+    ),
+
+  listProjects: () => request<{ projects: ProjectSummary[] }>("/api/projects"),
 
   getTicket: (ticketId: number) => request<Ticket>(`/api/tickets/${ticketId}`),
 

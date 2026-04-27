@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Bot, LayoutDashboard, LogIn, LogOut, Plus } from "lucide-react";
 import { Button } from "./common";
-import { cx, initials } from "../lib";
+import { cx } from "../lib";
 import type { ApiUser } from "../types";
 
 export type ViewKey = "dashboard" | "assistant";
@@ -28,10 +28,6 @@ export function AppShell({
   return (
     <div className="app-shell">
       <header className="topnav">
-        <div className="brand" aria-label="ITS Ops Console">
-          <div className="brand-mark">IT</div>
-          <span className="brand-name">Ops Console</span>
-        </div>
         <nav className="tabs" aria-label="Primary navigation">
           <button
             className={cx("tab", activeView === "dashboard" && "is-active")}
@@ -55,8 +51,8 @@ export function AppShell({
           {user ? (
             <>
               <div className="user-chip" title={user.email}>
-                <span className="avatar">{initials(user.display_name, "U")}</span>
                 <span className="user-chip-text">{user.display_name}</span>
+                <span className="user-chip-meta">{user.email}</span>
               </div>
               <Button
                 className="compact-button"

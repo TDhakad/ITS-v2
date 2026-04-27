@@ -17,6 +17,14 @@ export interface ApiUser {
   last_login_at?: string | null;
 }
 
+export interface ProjectSummary {
+  id: number;
+  name: string;
+  slug: string;
+  description?: string;
+  owner_id?: number;
+}
+
 export interface KBReference {
   kb_id?: string;
   title?: string;
@@ -52,6 +60,8 @@ export interface Ticket {
   keywords: string[];
   app_name?: string | null;
   environment: Environment;
+  project_id?: number | null;
+  project_name?: string | null;
   created_at: string;
   updated_at: string;
   linked_kb_articles: KBReference[];
@@ -119,6 +129,7 @@ export interface CreateTicketPayload {
   description: string;
   user_id?: string;
   thread_id?: string;
+  project_id?: number | null;
   title?: string;
   app_name?: string | null;
   environment?: Environment;

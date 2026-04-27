@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 from pathlib import Path
 from typing import Annotated, Any
@@ -10,6 +11,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -28,7 +30,7 @@ from app.db import (
     add_project_member,
     add_chat_turn_messages,
     create_project,
-    find_duplicate_candidates,
+    find_recent_similar_tickets,
     get_project_by_id,
     get_session,
     get_ticket,
@@ -47,6 +49,7 @@ from app.db import (
 from app.db import (
     create_ticket as persist_ticket,
 )
+from app.llm import get_chat_model
 from app.schemas import (
     Environment,
     KBArticleRef,
@@ -83,6 +86,7 @@ templates = Jinja2Templates(directory="app/templates")
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 FRONTEND_INDEX = FRONTEND_DIST / "index.html"
 FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+LEGACY_KB_DIR = Path(__file__).resolve().parent.parent / "data-v2" / "knowledge_base"
 if FRONTEND_ASSETS.exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
 _db_initialized = False
@@ -93,7 +97,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     conversation_id: str | None = Field(default=None, max_length=120)
     thread_id: str | None = Field(default=None, max_length=120)
-    # user_id / clearance are resolved from session; these are fallbacks for unauthenticated use.
+    # user_id / clearance are resolved from session.
     user_id: str = Field(default="anonymous", min_length=1, max_length=120)
     app_name: str | None = Field(default=None, max_length=120)
     environment: Environment = Environment.UNKNOWN
@@ -136,6 +140,7 @@ class TicketCreateRequest(BaseModel):
     description: str = Field(min_length=1, max_length=8000)
     user_id: str = Field(default="anonymous", min_length=1, max_length=120)
     thread_id: str = Field(default="manual", min_length=1, max_length=120)
+    project_id: int | None = None
     title: str | None = Field(default=None, max_length=300)
     app_name: str | None = Field(default=None, max_length=120)
     environment: Environment = Environment.UNKNOWN
@@ -175,7 +180,9 @@ def swagger_ui(
 # ── Pages ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-def chat_page(request: Request) -> Response:
+def chat_page(request: Request, current_user: OptionalUser) -> Response:
+    if current_user is None:
+        return RedirectResponse(url="/login", status_code=303)
     if FRONTEND_INDEX.exists():
         return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "chat.html")
@@ -225,10 +232,10 @@ def health() -> dict[str, str]:
 @app.get("/api/chat/threads")
 def chat_threads(
     db: DBSession,
-    current_user: OptionalUser,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
-    resolved_user_id = str(current_user.id) if current_user else "anonymous"
+    resolved_user_id = str(current_user.id)
     threads = list_chat_threads(db, user_id=resolved_user_id)
     return {"threads": threads}
 
@@ -236,11 +243,11 @@ def chat_threads(
 @app.get("/api/chat/history")
 def chat_history(
     db: DBSession,
-    current_user: OptionalUser,
+    current_user: CurrentUser,
     thread_id: str | None = Query(default=None, max_length=120),
 ) -> dict[str, Any]:
     _ensure_db()
-    resolved_user_id = str(current_user.id) if current_user else "anonymous"
+    resolved_user_id = str(current_user.id)
     resolved_thread_id = _resolve_chat_thread_id(resolved_user_id, thread_id)
     try:
         records = list_chat_messages(
@@ -267,17 +274,11 @@ def chat_turn(
     payload: ChatRequest,
     request: Request,
     db: DBSession,
-    current_user: OptionalUser,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
-    settings = get_settings()
-    # Resolve identity from session first; fallback to request body for unauthenticated use.
-    if current_user:
-        resolved_user_id = str(current_user.id)
-        resolved_clearance = current_user.clearance
-    else:
-        resolved_user_id = payload.user_id
-        resolved_clearance = payload.clearance or UserClearance(settings.standard_user_clearance)
+    resolved_user_id = str(current_user.id)
+    resolved_clearance = current_user.clearance
     thread_id = _resolve_chat_thread_id(
         resolved_user_id,
         payload.thread_id or payload.conversation_id,
@@ -286,14 +287,23 @@ def chat_turn(
     # so the agent is always scoped to the correct project.
     resolved_project_id = payload.project_id
     resolved_project_ids: list[int] | None = None
-    if current_user and current_user.role != UserRole.ADMIN:
+    if current_user.role != UserRole.ADMIN:
         user_project_ids = get_user_project_ids(db, current_user.id)
-        if user_project_ids:
-            resolved_project_ids = user_project_ids
-            if payload.project_id and payload.project_id in user_project_ids:
-                resolved_project_id = payload.project_id
-            else:
-                resolved_project_id = user_project_ids[0]
+        if not user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No project access assigned to this user.",
+            )
+        resolved_project_ids = user_project_ids
+        if payload.project_id and payload.project_id not in user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to the requested project.",
+            )
+        if payload.project_id and payload.project_id in user_project_ids:
+            resolved_project_id = payload.project_id
+        else:
+            resolved_project_id = user_project_ids[0]
     try:
         graph = importlib.import_module("app.graph")
         runner = (
@@ -368,19 +378,36 @@ def chat_turn(
 def create_ticket(
     payload: TicketCreateRequest,
     db: DBSession,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
+    resolved_project_id = payload.project_id
+    if current_user.role != UserRole.ADMIN:
+        user_project_ids = get_user_project_ids(db, current_user.id)
+        if not user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No project access assigned to this user.",
+            )
+        if payload.project_id and payload.project_id not in user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to the requested project.",
+            )
+        resolved_project_id = payload.project_id or user_project_ids[0]
+
     try:
         summary = payload.title or payload.description.strip().splitlines()[0][:120]
         ticket = persist_ticket(
             db,
             TicketCreate(
                 status=TicketStatus.OPEN,
-                user_id=payload.user_id,
+                user_id=str(current_user.id),
                 thread_id=payload.thread_id,
                 app_name=payload.app_name,
                 environment=payload.environment,
-                user_clearance=payload.clearance,
+                user_clearance=current_user.clearance,
+                project_id=resolved_project_id,
                 intelligence=TicketIntelligence(
                     category=payload.category,
                     suggested_priority=payload.priority,
@@ -406,7 +433,7 @@ def create_ticket(
 @app.get("/api/tickets")
 def tickets(
     db: DBSession,
-    current_user: OptionalUser,
+    current_user: CurrentUser,
     status_filter: str | None = Query(default=None, alias="status"),
     user_id: str | None = None,
     project_id: int | None = Query(default=None),
@@ -420,19 +447,22 @@ def tickets(
     # tickets that belong to other projects.
     effective_project_id: int | None = project_id
     effective_project_ids: list[int] | None = None
-    if current_user and current_user.role != UserRole.ADMIN:
+    if current_user.role != UserRole.ADMIN:
         user_project_ids = get_user_project_ids(db, current_user.id)
-        if user_project_ids:
-            if project_id and project_id in user_project_ids:
-                effective_project_id = project_id  # honour the requested project
-            elif len(user_project_ids) == 1:
-                effective_project_id = user_project_ids[0]
-            else:
-                effective_project_ids = user_project_ids
-                effective_project_id = None
+        if not user_project_ids:
+            return {"tickets": []}
+        if project_id and project_id not in user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to the requested project.",
+            )
+        if project_id and project_id in user_project_ids:
+            effective_project_id = project_id
+        elif len(user_project_ids) == 1:
+            effective_project_id = user_project_ids[0]
         else:
-            # No project memberships — fall back to the user's own tickets only.
-            user_id = str(current_user.id)
+            effective_project_ids = user_project_ids
+            effective_project_id = None
 
     try:
         found = list_tickets(
@@ -450,33 +480,40 @@ def tickets(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Ticket listing unavailable.",
         ) from exc
-    return {"tickets": [ticket_to_api(ticket) for ticket in found]}
+    return {"tickets": [ticket_to_api(ticket, project_names=_project_name_map(db)) for ticket in found]}
 
 
 @app.get("/api/tickets/{ticket_id}")
-def ticket_detail(ticket_id: int, db: DBSession) -> dict[str, Any]:
+def ticket_detail(ticket_id: int, db: DBSession, current_user: CurrentUser) -> dict[str, Any]:
     _ensure_db()
     ticket = _safe_get_ticket(db, ticket_id)
     if not ticket:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
-    return ticket_to_api(ticket, include_conversation=True)
+    _assert_ticket_access(db, current_user, ticket)
+    return ticket_to_api(ticket, include_conversation=True, project_names=_project_name_map(db))
 
 
 @app.get("/api/tickets/{ticket_id}/insights")
-def ticket_insights(ticket_id: int, db: DBSession) -> dict[str, Any]:
+def ticket_insights(ticket_id: int, db: DBSession, current_user: CurrentUser) -> dict[str, Any]:
     _ensure_db()
     ticket = _safe_get_ticket(db, ticket_id)
     if not ticket:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
+    _assert_ticket_access(db, current_user, ticket)
 
-    duplicates = find_duplicate_candidates(
-        db,
-        ticket.intelligence.keywords,
+    similar_tickets = find_recent_similar_tickets(
+        ticket.intelligence.summary,
         exclude_ticket_id=ticket.id,
-        limit=5,
+        project_id=ticket.project_id,
+        limit=20,
     )
-    kb_refs = list(ticket.resolution.linked_kb_articles)
-    suggested_fixes = list(ticket.resolution.suggested_fixes)
+    duplicates = sorted(
+        similar_tickets,
+        key=lambda item: float(item.get("score") or 0.0),
+        reverse=True,
+    )[:10]
+    recent_related = similar_tickets[:10]
+    kb_refs: list[KBArticleRef] = []
     retrieval_available = True
 
     try:
@@ -491,22 +528,24 @@ def ticket_insights(ticket_id: int, db: DBSession) -> dict[str, Any]:
             clearance=UserClearance.INTERNAL,
         )
         docs = rag.retrieve(ticket.intelligence.summary, context, k=5)
-        kb_refs = rag.article_refs(docs) or kb_refs
+        kb_refs = rag.article_refs(docs)
     except Exception:
         logger.exception("Ticket insight knowledge retrieval failed")
         retrieval_available = False
         docs = []
 
-    if not suggested_fixes:
-        suggested_fixes = _suggest_fixes(ticket, kb_refs)
+    recommended_action, suggested_actions = _generate_recommended_actions(
+        ticket,
+        kb_refs,
+        duplicates,
+        recent_related,
+    )
 
     citations = [_kb_ref_to_api(ref) for ref in kb_refs]
     return {
         "ticket_id": ticket.id,
         "summary": ticket.intelligence.summary,
-        "recommended_action": (
-            suggested_fixes[0] if suggested_fixes else "Review the ticket context."
-        ),
+        "recommended_action": recommended_action,
         "suggested_priority": ticket.intelligence.suggested_priority.value,
         "signals": [
             ticket.intelligence.category.value,
@@ -516,7 +555,17 @@ def ticket_insights(ticket_id: int, db: DBSession) -> dict[str, Any]:
         "citations": citations,
         "references": citations,
         "duplicates": duplicates,
-        "suggested_fixes": suggested_fixes,
+        "recent_tickets": [
+            {
+                "ticket_id": item.get("ticket_id"),
+                "summary": item.get("summary"),
+                "status": item.get("status"),
+                "priority": item.get("priority"),
+                "created_at": item.get("created_at"),
+            }
+            for item in recent_related
+        ],
+        "suggested_fixes": suggested_actions,
         "retrieved_chunks": len(docs),
         "retrieval_available": retrieval_available,
     }
@@ -666,10 +715,13 @@ def auth_reset_password(
 @app.get("/api/projects")
 def get_projects(
     db: DBSession,
-    _: CurrentUser,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
     records = list_projects(db)
+    if current_user.role != UserRole.ADMIN:
+        allowed_ids = set(get_user_project_ids(db, current_user.id))
+        records = [record for record in records if record.id in allowed_ids]
     return {"projects": [
         {"id": r.id, "name": r.name, "slug": r.slug,
          "description": r.description, "owner_id": r.owner_id}
@@ -794,13 +846,36 @@ def get_tags(db: DBSession) -> dict[str, Any]:
                      for t in tags]}
 
 
+@app.get("/api/kb/doc")
+def get_kb_doc(
+    current_user: CurrentUser,
+    source: str | None = Query(default=None, max_length=500),
+    kb_id: str | None = Query(default=None, max_length=200),
+) -> FileResponse:
+    resolved = _resolve_kb_doc_path(source=source, kb_id=kb_id)
+    if resolved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge article not found")
+
+    user_level = _clearance_level(current_user.clearance)
+    article_level = _kb_doc_clearance_level(resolved)
+    if user_level < article_level:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this knowledge article.",
+        )
+
+    return FileResponse(path=resolved, media_type="text/markdown", filename=resolved.name)
+
+
 @app.get("/{frontend_path:path}", include_in_schema=False)
-def frontend_fallback(frontend_path: str) -> FileResponse:
+def frontend_fallback(frontend_path: str, current_user: OptionalUser) -> Response:
     """Serve React client routes from the production build when available."""
     blocked_prefixes = ("api/", "auth/", "static/", "assets/")
     blocked_exact = {"api", "auth", "static", "assets", "docs", "openapi.json"}
     if frontend_path in blocked_exact or frontend_path.startswith(blocked_prefixes):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if current_user is None:
+        return RedirectResponse(url="/login", status_code=303)
     if not FRONTEND_INDEX.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     return FileResponse(FRONTEND_INDEX)
@@ -810,6 +885,105 @@ def _result_value(result: Any, key: str, default: Any = None) -> Any:
     if isinstance(result, dict):
         return result.get(key, default)
     return getattr(result, key, default)
+
+
+def _kb_search_roots() -> list[Path]:
+    roots: list[Path] = []
+    for candidate in (get_settings().kb_dir, LEGACY_KB_DIR):
+        resolved = candidate.resolve()
+        if resolved.exists() and resolved.is_dir() and resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _resolve_kb_doc_path(source: str | None, kb_id: str | None) -> Path | None:
+    candidate_names: list[str] = []
+    if source:
+        candidate_names.append(source.strip().lstrip("/"))
+    if kb_id:
+        candidate_names.extend([f"{kb_id}.md", f"{kb_id}.markdown", kb_id])
+
+    for root in _kb_search_roots():
+        for candidate in candidate_names:
+            resolved = _resolve_kb_candidate(root, candidate)
+            if resolved is not None:
+                return resolved
+    return None
+
+
+def _resolve_kb_candidate(root: Path, candidate: str) -> Path | None:
+    cleaned = candidate.strip().replace("\\", "/")
+    if not cleaned:
+        return None
+    candidate_path = Path(cleaned)
+    if candidate_path.is_absolute():
+        return None
+
+    direct = (root / candidate_path).resolve()
+    if _is_kb_doc(direct, root):
+        return direct
+
+    filename = candidate_path.name
+    if not filename:
+        return None
+    for possible in root.rglob(filename):
+        resolved = possible.resolve()
+        if _is_kb_doc(resolved, root):
+            return resolved
+    return None
+
+
+def _is_kb_doc(path: Path, root: Path) -> bool:
+    if path.suffix.lower() not in {".md", ".markdown", ".txt"}:
+        return False
+    if not path.is_file():
+        return False
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _kb_doc_clearance_level(path: Path) -> int:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return 0
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return 0
+
+    for line in lines[1:80]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if ":" not in stripped:
+            continue
+        key, raw_value = stripped.split(":", 1)
+        normalized_key = key.strip().lower()
+        if normalized_key in {"clearance", "clearance_level"}:
+            return _clearance_level(raw_value.strip())
+    return 0
+
+
+def _clearance_level(value: Any) -> int:
+    if hasattr(value, "value"):
+        value = value.value
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).strip().lower()
+    aliases = {"public": 0, "internal": 1, "restricted": 2}
+    if text in aliases:
+        return aliases[text]
+    try:
+        return int(text)
+    except ValueError:
+        return 0
 
 
 def _ensure_db() -> None:
@@ -827,6 +1001,14 @@ def _safe_get_ticket(db: Session, ticket_id: Any) -> TicketRead | None:
     except (TypeError, ValueError):
         return None
     return get_ticket(db, parsed_ticket_id)
+
+
+def _assert_ticket_access(db: Session, current_user: UserRead, ticket: TicketRead) -> None:
+    if current_user.role == UserRole.ADMIN:
+        return
+    allowed_project_ids = set(get_user_project_ids(db, current_user.id))
+    if ticket.project_id is None or ticket.project_id not in allowed_project_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
 
 
 def _resolve_chat_thread_id(user_id: str, requested_thread_id: str | None = None) -> str:
@@ -853,7 +1035,16 @@ def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
     return counts
 
 
-def ticket_to_api(ticket: TicketRead, include_conversation: bool = False) -> dict[str, Any]:
+def _project_name_map(db: Session) -> dict[int, str]:
+    """Return a {project_id: project_name} dict for all active projects."""
+    return {p.id: p.name for p in list_projects(db, active_only=False)}
+
+
+def ticket_to_api(
+    ticket: TicketRead,
+    include_conversation: bool = False,
+    project_names: dict[int, str] | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": ticket.id,
         "ticket_id": ticket.id,
@@ -873,13 +1064,12 @@ def ticket_to_api(ticket: TicketRead, include_conversation: bool = False) -> dic
         "keywords": ticket.intelligence.keywords,
         "app_name": ticket.app_name,
         "environment": ticket.environment.value,
+        "project_id": ticket.project_id,
+        "project_name": (project_names or {}).get(ticket.project_id) if ticket.project_id else None,
         "created_at": ticket.created_at.isoformat(),
         "updated_at": ticket.updated_at.isoformat(),
-        "linked_kb_articles": [
-            _kb_ref_to_api(ref)
-            for ref in ticket.resolution.linked_kb_articles
-        ],
-        "duplicate_ticket_ids": ticket.resolution.duplicate_ticket_ids,
+        "linked_kb_articles": [],
+        "duplicate_ticket_ids": [],
     }
     if include_conversation:
         payload["conversation"] = [
@@ -924,31 +1114,97 @@ def _status_to_api(value: TicketStatus) -> str:
     return value.value.casefold().replace(" ", "_")
 
 
-def _suggest_fixes(ticket: TicketRead, refs: list[KBArticleRef]) -> list[str]:
-    category = ticket.intelligence.category
-    if refs:
-        return [f"Review {refs[0].title} and compare it with the reported symptoms."]
-    if category == TicketCategory.UI:
-        return [
-            "Reproduce in a supported browser and collect screenshot, console errors, "
-            "and cache state."
-        ]
-    if category == TicketCategory.HARDWARE:
-        return [
-            "Confirm asset tag, device health, recent physical changes, and replacement "
-            "eligibility."
-        ]
-    if category == TicketCategory.INFRA:
-        return [
-            "Check service health, access scope, recent changes, and whether elevated "
-            "access is required."
-        ]
-    if category == TicketCategory.BUG:
-        return [
-            "Reproduce with exact steps, identify last known good version, and attach "
-            "logs or traces."
-        ]
-    return [
-        "Clarify business impact, acceptance criteria, and whether this is a new "
-        "request or regression."
-    ]
+def _generate_recommended_actions(
+    ticket: TicketRead,
+    refs: list[KBArticleRef],
+    duplicates: list[dict[str, Any]],
+    recent_tickets: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    payload = {
+        "ticket": {
+            "id": ticket.id,
+            "summary": ticket.intelligence.summary,
+            "category": ticket.intelligence.category.value,
+            "priority": ticket.intelligence.suggested_priority.value,
+            "keywords": ticket.intelligence.keywords[:8],
+            "app_name": ticket.app_name,
+            "environment": ticket.environment.value,
+        },
+        "similar_tickets_by_score": duplicates[:6],
+        "recent_similar_tickets": recent_tickets[:10],
+        "knowledge_refs": [
+            {
+                "kb_id": ref.kb_id,
+                "title": ref.title,
+                "source": ref.source,
+                "relevance_score": ref.relevance_score,
+            }
+            for ref in refs[:6]
+        ],
+    }
+
+    try:
+        response = get_chat_model().invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are an IT operations copilot generating incident recommendations. "
+                        "Use only provided evidence. Not every ticket is a bug: feature, infra, "
+                        "access, and hardware requests can be valid outcomes. "
+                        "Return exactly 1 to 4 concise recommended actions, one per line, "
+                        "ordered by priority. No bullets, no numbering, no markdown."
+                    )
+                ),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=True)),
+            ]
+        )
+        raw_content = getattr(response, "content", response)
+        text = _coerce_llm_text(raw_content)
+        actions = _extract_action_lines(text)
+        if actions:
+            return actions[0], actions
+    except Exception:
+        logger.exception("Ticket insight recommendation generation failed")
+
+    fallback = "Review retrieved similar tickets and knowledge references before deciding next workflow step."
+    return fallback, [fallback]
+
+
+def _coerce_llm_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+    return str(value).strip()
+
+
+def _extract_action_lines(text: str, *, max_items: int = 4) -> list[str]:
+    if not text:
+        return []
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        candidate = line.strip().lstrip("-*0123456789. ").strip()
+        if not candidate:
+            continue
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        cleaned.append(candidate)
+        seen.add(key)
+        if len(cleaned) >= max_items:
+            break
+
+    if cleaned:
+        return cleaned
+    single = text.strip()
+    return [single] if single else []
