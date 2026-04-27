@@ -1,7 +1,7 @@
 import { Bot, FileText, MessageSquare, Plus, Send, Shield, Ticket as TicketIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { api } from "../api/client";
-import { formatTime, generateId, initials, kbReferenceHref } from "../lib";
+import { formatTime, generateId, kbReferenceHref } from "../lib";
 import type { ApiUser, ChatHistoryMessage, ChatMessage, ChatThread, LoadState, Ticket } from "../types";
 import { Button, EmptyState, LoadingState } from "./common";
 import { MarkdownContent } from "./MarkdownContent";
@@ -171,7 +171,7 @@ export function AssistantPage({
     <section className="assistant-page" aria-label="AI assistant">
       <aside className="chat-history">
         <div className="chat-history-top">
-          <strong>Conversations</strong>
+          <strong>Assistant Console</strong>
           <Button
             icon={<Plus size={15} aria-hidden="true" />}
             onClick={() => {
@@ -187,6 +187,7 @@ export function AssistantPage({
           </Button>
         </div>
         <div className="chat-history-list">
+          <p className="side-section">Conversations</p>
           {threads.length ? (
             threads.map((thread) => (
               <button
@@ -227,11 +228,12 @@ export function AssistantPage({
         </header>
         <div className="message-list" aria-live="polite">
           {messages.map((message) => (
-            <article className={`bubble-row ${message.role === "user" ? "mine" : ""}`} key={message.id}>
-              <span className={`bubble-avatar ${message.role === "user" ? "mine" : "ai"}`}>
-                {message.role === "user" ? initials(user?.display_name, "U") : "AI"}
-              </span>
+            <article className={`bubble-row ${message.role === "user" ? "mine" : "assistant"}`} key={message.id}>
               <div className={`bubble ${message.role === "user" ? "mine" : "ai"}`}>
+                <div className="bubble-meta">
+                  <strong>{message.role === "user" ? (user?.display_name ?? "You") : "AI Assistant"}</strong>
+                  <span>{formatTime(message.createdAt)}</span>
+                </div>
                 <MarkdownContent
                   content={message.content}
                   onTicketSelect={onTicketSelect}
@@ -264,7 +266,6 @@ export function AssistantPage({
                     Created ticket #{message.ticket.id}
                   </button>
                 ) : null}
-                <time>{formatTime(message.createdAt)}</time>
               </div>
             </article>
           ))}

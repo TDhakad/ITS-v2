@@ -264,8 +264,8 @@ export default function App() {
         onSearchChange={(value) => dispatch({ type: "search", value })}
         onFilterChange={(value) => dispatch({ type: "side-filter", value })}
         onTicketSelect={selectTicket}
-        onNewTicket={() => dispatch({ type: "new-ticket-open", value: true })}
         onRetry={() => void loadTickets(state.activeProjectId)}
+        onViewChange={(view) => navigate(view === "assistant" ? "/assistant" : "/")}
       />
     );
   }
