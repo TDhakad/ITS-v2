@@ -26,11 +26,14 @@ from app.auth import (
 )
 from app.db import (
     add_project_member,
+    add_chat_turn_messages,
     create_project,
     find_duplicate_candidates,
     get_session,
     get_ticket,
     init_db,
+    list_chat_messages,
+    list_chat_threads,
     list_projects,
     list_tags,
     list_tickets,
@@ -212,6 +215,46 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/chat/threads")
+def chat_threads(
+    db: DBSession,
+    current_user: OptionalUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    resolved_user_id = str(current_user.id) if current_user else "anonymous"
+    threads = list_chat_threads(db, user_id=resolved_user_id)
+    return {"threads": threads}
+
+
+@app.get("/api/chat/history")
+def chat_history(
+    db: DBSession,
+    current_user: OptionalUser,
+    thread_id: str | None = Query(default=None, max_length=120),
+) -> dict[str, Any]:
+    _ensure_db()
+    resolved_user_id = str(current_user.id) if current_user else "anonymous"
+    resolved_thread_id = _resolve_chat_thread_id(resolved_user_id, thread_id)
+    try:
+        records = list_chat_messages(
+            db,
+            user_id=resolved_user_id,
+            thread_id=resolved_thread_id,
+        )
+    except SQLAlchemyError as exc:
+        logger.exception("Chat history unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat history unavailable.",
+        ) from exc
+
+    return {
+        "conversation_id": resolved_thread_id,
+        "thread_id": resolved_thread_id,
+        "messages": [_chat_message_to_api(record) for record in records],
+    }
+
+
 @app.post("/api/chat")
 def chat_turn(
     payload: ChatRequest,
@@ -228,7 +271,10 @@ def chat_turn(
     else:
         resolved_user_id = payload.user_id
         resolved_clearance = payload.clearance or UserClearance(settings.standard_user_clearance)
-    thread_id = payload.thread_id or payload.conversation_id or f"{resolved_user_id}-default"
+    thread_id = _resolve_chat_thread_id(
+        resolved_user_id,
+        payload.thread_id or payload.conversation_id,
+    )
     try:
         graph = importlib.import_module("app.graph")
         runner = (
@@ -282,6 +328,17 @@ def chat_turn(
     }
     if ticket:
         response["ticket"] = ticket_to_api(ticket)
+    try:
+        add_chat_turn_messages(
+            db,
+            user_id=resolved_user_id,
+            thread_id=thread_id,
+            user_message=payload.message,
+            assistant_message=response_text,
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Could not persist chat history for thread %s", thread_id)
     return response
 
 
@@ -637,6 +694,22 @@ def _safe_get_ticket(db: Session, ticket_id: Any) -> TicketRead | None:
     except (TypeError, ValueError):
         return None
     return get_ticket(db, parsed_ticket_id)
+
+
+def _resolve_chat_thread_id(user_id: str, requested_thread_id: str | None = None) -> str:
+    prefix = f"user:{user_id}:"
+    if requested_thread_id and requested_thread_id.startswith(prefix):
+        return requested_thread_id
+    return f"{prefix}default"
+
+
+def _chat_message_to_api(message: Any) -> dict[str, Any]:
+    return {
+        "id": str(message.id),
+        "role": message.role,
+        "content": message.content,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+    }
 
 
 def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:

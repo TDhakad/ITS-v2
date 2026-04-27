@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import re as _re
 from functools import lru_cache
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -59,6 +60,51 @@ from app.settings import get_settings
 from app.ticket_vector import search_ticket_vectors
 
 logger = logging.getLogger(__name__)
+
+
+# ── Intent classification ──────────────────────────────────────────────────────
+# Fast regex pass on the incoming message to inject a tool-selection hint into
+# the system prompt, reducing the model's reasoning overhead.
+
+_ANALYTICS_RE = _re.compile(
+    r"\b(how many|count|total|breakdown|break.?down|by status|by priority|by category|"
+    r"trend|statistics?|report|open tickets?|closed tickets?|per (day|week|month)|"
+    r"tickets? (per|by|in|with|for))",
+    _re.IGNORECASE,
+)
+_KB_RE = _re.compile(
+    r"\b(how (do|to|can)|steps to|fix|solve|troubleshoot|configure|install|setup|"
+    r"reset password|not working|doesn.t work)",
+    _re.IGNORECASE,
+)
+_STATUS_RE = _re.compile(
+    r"\b(is there (a|an) ticket|(my|the) ticket (status|about|for)|"
+    r"already (filed|a ticket)|existing ticket|check (my )?ticket)",
+    _re.IGNORECASE,
+)
+_CREATE_RE = _re.compile(
+    r"\b(create|file|submit|open|raise) (a |an )?(new )?(ticket|issue|request|bug)",
+    _re.IGNORECASE,
+)
+
+_INTENT_HINTS: dict[str, str] = {
+    "analytics": "\n\n[INTENT: analytics] → call analyze_ticket_data immediately.",
+    "create": "\n\n[INTENT: create ticket] → gather summary/category/priority then call create_helpdesk_ticket.",
+    "status": "\n\n[INTENT: status check] → call search_existing_tickets immediately.",
+    "kb": "\n\n[INTENT: kb lookup] → call search_knowledge_base immediately.",
+}
+
+
+def _classify_intent(message: str) -> str | None:
+    if _ANALYTICS_RE.search(message):
+        return "analytics"
+    if _CREATE_RE.search(message):
+        return "create"
+    if _STATUS_RE.search(message):
+        return "status"
+    if _KB_RE.search(message):
+        return "kb"
+    return None
 
 
 # ── Per-request context ────────────────────────────────────────────────────────
@@ -169,7 +215,7 @@ def search_existing_tickets(query: str) -> str:
                 query,
                 user_id=_scoped_ticket_user_id(ctx),
                 project_id=ctx.get("project_id"),
-                limit=5,
+                limit=15,
             )
         if not results:
             return f"No existing tickets found matching '{query}'."
@@ -209,7 +255,7 @@ def vector_search_tickets(
     query: str,
     status: str | None = None,
     priority: str | None = None,
-    tags: list[str] | None = None,
+    tags: str | None = None,
 ) -> str:
     """Semantic vector search over historical tickets in Pinecone.
 
@@ -221,18 +267,22 @@ def vector_search_tickets(
     Optional filters:
     - status: Open, Triaged, In Progress, Resolved, or Closed
     - priority: Low, Medium, High, or Critical
-    - tags: impact-area slugs such as access, infra, security, network, ui
+    - tags: comma-separated impact-area slugs, e.g. "access,infra" or "security"
     """
     ctx = _request_ctx()
+    # Coerce tags from a comma-separated string to a list (LLMs often pass a string).
+    tag_list: list[str] | None = (
+        [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    )
     try:
         results = search_ticket_vectors(
             query,
             user_id=_scoped_ticket_user_id(ctx),
             project_id=ctx.get("project_id"),
-            tag_slugs=tags,
+            tag_slugs=tag_list,
             status=_enum_value(status, TicketStatus),
             priority=_enum_value(priority, Priority),
-            limit=5,
+            limit=15,
         )
         if not results:
             return f"No semantically similar tickets found for '{query}'."
@@ -339,32 +389,17 @@ _TOOLS: list[BaseTool] = [
 _TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in _TOOLS}
 
 _SYSTEM_PROMPT = """\
-You are an IT helpdesk assistant. Help users resolve IT issues through natural conversation.
+You are an IT helpdesk assistant. Help users resolve IT issues concisely and professionally.
 
-How to handle requests:
-- Ask follow-up questions naturally when you need more details, such as the app,
-  exact error message, affected users, and when the issue started.
-- To resolve issues: Always search the Knowledge Base (search_knowledge_base)
-  AND historical tickets for potential solutions.
-    - Prioritize official KB articles: Provide clear, actionable steps from the KB first.
-    - Use analyze_ticket_data for exact ticket counts, totals, aggregations,
-      breakdowns, trends, or when the user asks to list/show matching tickets.
-      Counts must come from this SQL-backed analytics tool, not from search result limits.
-    - Use vector_search_tickets when a user describes symptoms, impact, errors,
-      or an issue in natural language and you need semantically similar tickets.
-    - Use search_existing_tickets when the user asks for exact ticket status,
-      direct keyword matches, or whether a specific topic already exists.
-    - Fallback to past tickets: If the KB lacks an answer, look for verified fixes.
-    - If helpful information is found, guide the user through it. Otherwise,
-      maintain a natural flow to gather more context.
-- To check statuses: When a user asks if a ticket already exists or wants an
-  update on a past request, use search_existing_tickets to find their record.
-- Create a new ticket when: the issue requires admin/privileged access, hardware
-  replacement, cannot be resolved via documentation/past fixes, or the user
-  explicitly requests one.
-  When creating a ticket, always include relevant impact-area tags from: ui,
-  hardware, access, infra, security, network, performance, data.
-- Be concise and professional. This is a business IT support tool."""
+Tool guidance — pick exactly one per turn based on the user's intent:
+- search_knowledge_base: user has an IT problem → search KB first; return actionable steps.
+- analyze_ticket_data: user asks for counts, totals, breakdowns, trends, or to list tickets. Never estimate counts from search results — always use this tool.
+- search_existing_tickets: user asks if a ticket exists or wants a status update.
+- vector_search_tickets: user describes symptoms or impact in natural language to find similar past incidents.
+- create_helpdesk_ticket: issue needs human intervention, privileged access, hardware replacement, or the user explicitly asks. Always include impact-area tags: ui, hardware, access, infra, security, network, performance, data.
+
+Ask follow-up questions when you need the app name, error message, or affected scope.
+If the KB has no answer, check similar past tickets before creating a new one."""
 
 
 # ── Graph nodes ────────────────────────────────────────────────────────────────
@@ -428,9 +463,18 @@ def agent_node(state: HelpdeskAgentState) -> dict[str, Any]:
     ctx = _request_ctx()
     ctx["messages_snapshot"] = list(state.get("messages", []))
 
+    # Inject a one-line intent hint so the LLM skips tool-selection reasoning
+    # for clear-cut requests, saving at least one reasoning step.
+    last_human = next(
+        (m for m in reversed(state.get("messages", [])) if isinstance(m, HumanMessage)),
+        None,
+    )
+    intent = _classify_intent(last_human.content if last_human else "")
+    system_content = _SYSTEM_PROMPT + (_INTENT_HINTS.get(intent or "", ""))
+
     llm = get_chat_model().bind_tools(_TOOLS)
     messages: list[BaseMessage] = [
-        SystemMessage(content=_SYSTEM_PROMPT),
+        SystemMessage(content=system_content),
         *state.get("messages", []),
     ]
     response = llm.invoke(messages)
@@ -570,7 +614,10 @@ def run_chat_turn(
             "environment": environment,
             "user_clearance": clearance,
         },
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 15,
+        },
     )
 
     # Find the last non-tool-call AI message — that's what the user sees.

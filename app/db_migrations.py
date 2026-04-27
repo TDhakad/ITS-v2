@@ -75,7 +75,38 @@ def _backfill_ticket_messages(connection: Connection) -> None:
         db.flush()
 
 
+def _create_chat_messages(connection: Connection) -> None:
+    connection.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER NOT NULL PRIMARY KEY,
+                user_id VARCHAR(120) NOT NULL,
+                thread_id VARCHAR(120) NOT NULL,
+                role VARCHAR(40) NOT NULL,
+                content TEXT NOT NULL,
+                created_at DATETIME NOT NULL
+            )
+            """
+        )
+    )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_messages_id ON chat_messages (id)"))
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_user_id ON chat_messages (user_id)")
+    )
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_thread_id ON chat_messages (thread_id)")
+    )
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_role ON chat_messages (role)")
+    )
+    connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_created_at ON chat_messages (created_at)")
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     ("0001_initial_schema", _initial_schema),
     ("0002_backfill_ticket_messages", _backfill_ticket_messages),
+    ("0003_create_chat_messages", _create_chat_messages),
 )

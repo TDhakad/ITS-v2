@@ -1,6 +1,8 @@
 import type {
   ApiUser,
+  ChatHistoryResponse,
   ChatResponse,
+  ChatThreadsResponse,
   CreateTicketPayload,
   CreateTicketResponse,
   Ticket,
@@ -101,6 +103,13 @@ export const api = {
 
   getTicketInsights: (ticketId: number) =>
     request<TicketInsight>(`/api/tickets/${ticketId}/insights`),
+
+  getChatHistory: (threadId?: string) =>
+    request<ChatHistoryResponse>(
+      `/api/chat/history${threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ""}`
+    ),
+
+  getChatThreads: () => request<ChatThreadsResponse>("/api/chat/threads"),
 
   createTicket: (payload: CreateTicketPayload) =>
     request<CreateTicketResponse>("/api/tickets", {

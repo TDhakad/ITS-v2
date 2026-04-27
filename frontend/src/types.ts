@@ -91,6 +91,30 @@ export interface ChatResponse {
   ticket?: Ticket;
 }
 
+export interface ChatHistoryMessage {
+  id?: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at?: string | null;
+}
+
+export interface ChatHistoryResponse {
+  conversation_id: string;
+  thread_id: string;
+  messages: ChatHistoryMessage[];
+}
+
+export interface ChatThread {
+  thread_id: string;
+  last_at: string | null;
+  message_count: number;
+  preview: string;
+}
+
+export interface ChatThreadsResponse {
+  threads: ChatThread[];
+}
+
 export interface CreateTicketPayload {
   description: string;
   user_id?: string;

@@ -138,6 +138,21 @@ class AuthSessionRecord(Base):
     user: Mapped[UserRecord] = relationship(back_populates="sessions")
 
 
+class ChatMessageRecord(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(120), index=True)
+    thread_id: Mapped[str] = mapped_column(String(120), index=True)
+    role: Mapped[str] = mapped_column(String(40), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        index=True,
+    )
+
+
 # ── Project models ─────────────────────────────────────────────────────────────
 
 class ProjectRecord(Base):
@@ -386,6 +401,95 @@ def get_session() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def add_chat_turn_messages(
+    db: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    now = utcnow()
+    db.add_all(
+        [
+            ChatMessageRecord(
+                user_id=user_id,
+                thread_id=thread_id,
+                role="user",
+                content=user_message,
+                created_at=now,
+            ),
+            ChatMessageRecord(
+                user_id=user_id,
+                thread_id=thread_id,
+                role="assistant",
+                content=assistant_message,
+                created_at=utcnow(),
+            ),
+        ]
+    )
+    db.commit()
+
+
+def list_chat_threads(
+    db: Session,
+    *,
+    user_id: str,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Return the most-recently-active chat threads for a user with a preview."""
+    # One subquery row per thread: the latest message timestamp and total count.
+    from sqlalchemy import func, case
+
+    subq = (
+        select(
+            ChatMessageRecord.thread_id,
+            func.max(ChatMessageRecord.created_at).label("last_at"),
+            func.count(ChatMessageRecord.id).label("message_count"),
+            func.min(
+                case(
+                    (ChatMessageRecord.role == "user", ChatMessageRecord.content),
+                    else_=None,
+                )
+            ).label("preview"),
+        )
+        .where(ChatMessageRecord.user_id == user_id)
+        .group_by(ChatMessageRecord.thread_id)
+        .order_by(func.max(ChatMessageRecord.created_at).desc())
+        .limit(limit)
+        .subquery()
+    )
+    rows = db.execute(select(subq)).mappings().all()
+    return [
+        {
+            "thread_id": row["thread_id"],
+            "last_at": row["last_at"].isoformat() if row["last_at"] else None,
+            "message_count": row["message_count"],
+            "preview": (row["preview"] or "")[:80],
+        }
+        for row in rows
+    ]
+
+
+def list_chat_messages(
+    db: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+    limit: int = 200,
+) -> list[ChatMessageRecord]:
+    stmt = (
+        select(ChatMessageRecord)
+        .where(
+            ChatMessageRecord.user_id == user_id,
+            ChatMessageRecord.thread_id == thread_id,
+        )
+        .order_by(ChatMessageRecord.created_at.asc(), ChatMessageRecord.id.asc())
+        .limit(limit)
+    )
+    return list(db.scalars(stmt).all())
 
 
 def _ticket_read_options() -> tuple[Any, ...]:

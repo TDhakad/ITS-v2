@@ -165,19 +165,21 @@ ANALYTICS_GRAPH_PROMPT = """You are an admin analytics agent for an IT ticketing
 
 Use tools before answering factual analytics questions.
 
+IMPORTANT: Return your final answer immediately after the FIRST tool result that answers
+the question. Do not call additional tools unless the first result was clearly insufficient.
+
 Tool guidance:
-- Use count_tickets for exact ticket counts.
-- Use group_tickets for breakdowns by status, priority, category, user, app, environment, or project.
-- Use list_tickets to fetch matching ticket rows after an exact count or when the admin asks to show tickets.
-- Use ticket_trend for time-series counts.
-- Use semantic_ticket_search for themes, similar incidents, recurring complaints, and fuzzy natural-language topics.
-- Use run_read_only_sql only when the structured tools cannot express the question.
+- count_tickets → exact ticket counts.
+- group_tickets → breakdowns by status, priority, category, user, app, environment, or project.
+- list_tickets → fetch matching ticket rows (use after counting, or when asked to show tickets).
+- ticket_trend → time-series counts by day/week/month.
+- semantic_ticket_search → themes, similar incidents, recurring complaints (approximate, not for exact counts).
+- run_read_only_sql → last resort only, when no structured tool can express the question.
 
 Rules:
 - SQL/database tool results are the source of truth for counts, comparisons, and trends.
 - Vector search is approximate. Never use vector results to produce exact counts.
 - For mixed questions, use SQL for the number and vector search for qualitative examples/themes.
-- For dashboard-style related/contains searches, use text_query with count_tickets/list_tickets.
 - Today's date is {today}. Prefer date_range values when they match the user's request.
 - Be concise and explain any limitation, such as missing assignee/resolver fields.
 
@@ -312,7 +314,7 @@ def run_admin_analytics_question(question: str) -> dict[str, Any]:
         graph = _get_analytics_graph()
         state = graph.invoke(
             {"messages": [HumanMessage(content=clean_question)]},
-            config={"recursion_limit": 8},
+            config={"recursion_limit": 5},  # agent→tools→agent→tools→agent = 5 max
         )
         answer = _final_message_text(state.get("messages", []))
         if answer and not trace["tools"] and _requires_grounding(clean_question):
@@ -756,7 +758,8 @@ def _analytics_tools_node(state: AdminAnalyticsState) -> dict[str, Any]:
 
 def _route_after_analytics_agent(state: AdminAnalyticsState) -> Literal["tools", "__end__"]:
     last = state["messages"][-1]
-    if isinstance(last, AIMessage) and last.tool_calls and state.get("tool_rounds", 0) < 3:
+    # Allow at most 2 tool rounds (handles count+list combos); most queries need only 1.
+    if isinstance(last, AIMessage) and last.tool_calls and state.get("tool_rounds", 0) < 2:
         return "tools"
     return "__end__"
 
@@ -772,8 +775,8 @@ def _get_sql_agent() -> Any:
         agent_type="tool-calling",
         prefix=SQL_AGENT_PREFIX.replace("{today}", _today_iso()),
         top_k=25,
-        max_iterations=15,
-        max_execution_time=120,
+        max_iterations=5,          # was 15 — hard cap to stay within 30 s budget
+        max_execution_time=20,     # was 120 s — fail fast and surface the structured fallback
         verbose=False,
         agent_executor_kwargs={
             "handle_parsing_errors": _PARSING_ERROR_MESSAGE,

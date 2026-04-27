@@ -1,8 +1,8 @@
-import { Bot, FileText, Plus, Send, Shield, Ticket as TicketIcon } from "lucide-react";
-import { useMemo, useState, type FormEvent } from "react";
+import { Bot, FileText, MessageSquare, Plus, Send, Shield, Ticket as TicketIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { api } from "../api/client";
 import { formatTime, generateId, initials } from "../lib";
-import type { ApiUser, ChatMessage, LoadState, Ticket } from "../types";
+import type { ApiUser, ChatHistoryMessage, ChatMessage, ChatThread, LoadState, Ticket } from "../types";
 import { Button, EmptyState, LoadingState } from "./common";
 import { MarkdownContent } from "./MarkdownContent";
 
@@ -20,27 +20,86 @@ const suggestions = [
   "Show onboarding gaps"
 ];
 
+const defaultAssistantText =
+  "I have context from the ticket API and knowledge references returned by the assistant endpoint.";
+
 export function AssistantPage({
   tickets,
   user,
   onTicketCreated,
   onTicketSelect
 }: AssistantPageProps) {
-  const [conversationId, setConversationId] = useState(() => generateId("chat"));
+  const [conversationId, setConversationId] = useState(() => defaultThreadId(null));
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    {
-      id: generateId("msg"),
-      role: "assistant",
-      content:
-        "I have context from the ticket API and knowledge references returned by the assistant endpoint.",
-      createdAt: new Date().toISOString()
-    }
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => [defaultAssistantMessage()]);
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [threads, setThreads] = useState<ChatThread[]>([]);
 
   const recentTickets = useMemo(() => tickets.slice(0, 6), [tickets]);
+
+  // Fetch thread list once on mount and after each message so the sidebar stays fresh.
+  const refreshThreads = useCallback(() => {
+    api.getChatThreads().then((res) => setThreads(res.threads)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshThreads();
+  }, [refreshThreads]);
+
+  useEffect(() => {
+    let active = true;
+    const storageKey = threadStorageKey(user);
+    const requestedThreadId = readThreadId(storageKey) ?? defaultThreadId(user);
+
+    setState("loading");
+    setError(null);
+
+    api
+      .getChatHistory(requestedThreadId)
+      .then((history) => {
+        if (!active) {
+          return;
+        }
+        const nextThreadId = history.thread_id || requestedThreadId;
+        const restoredMessages = history.messages.map(historyMessageToChatMessage);
+        setConversationId(nextThreadId);
+        rememberThreadId(storageKey, nextThreadId);
+        setMessages(restoredMessages.length ? restoredMessages : [defaultAssistantMessage()]);
+        setState("idle");
+      })
+      .catch(() => {
+        if (!active) {
+          return;
+        }
+        setConversationId(requestedThreadId);
+        setMessages([defaultAssistantMessage()]);
+        setState("idle");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [user?.id]);
+
+  function loadThread(threadId: string) {
+    setState("loading");
+    setError(null);
+    api
+      .getChatHistory(threadId)
+      .then((history) => {
+        const restoredMessages = history.messages.map(historyMessageToChatMessage);
+        setConversationId(threadId);
+        rememberThreadId(threadStorageKey(user), threadId);
+        setMessages(restoredMessages.length ? restoredMessages : [defaultAssistantMessage()]);
+        setState("idle");
+      })
+      .catch(() => {
+        setConversationId(threadId);
+        setMessages([defaultAssistantMessage()]);
+        setState("idle");
+      });
+  }
 
   async function submitMessage(value: string) {
     const trimmed = value.trim();
@@ -75,6 +134,7 @@ export function AssistantPage({
       }
 
       setConversationId(response.thread_id || response.conversation_id || conversationId);
+      rememberThreadId(threadStorageKey(user), response.thread_id || response.conversation_id || conversationId);
       setMessages((current) => [
         ...current,
         {
@@ -87,6 +147,7 @@ export function AssistantPage({
         }
       ]);
       setState("ready");
+      refreshThreads();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Assistant request failed.";
       setError(message);
@@ -111,15 +172,10 @@ export function AssistantPage({
           <Button
             icon={<Plus size={15} aria-hidden="true" />}
             onClick={() => {
-              setConversationId(generateId("chat"));
-              setMessages([
-                {
-                  id: generateId("msg"),
-                  role: "assistant",
-                  content: "New conversation started.",
-                  createdAt: new Date().toISOString()
-                }
-              ]);
+              const nextThreadId = newThreadId(user);
+              setConversationId(nextThreadId);
+              rememberThreadId(threadStorageKey(user), nextThreadId);
+              setMessages([defaultAssistantMessage("New conversation started.")]);
               setError(null);
               setState("idle");
             }}
@@ -128,17 +184,34 @@ export function AssistantPage({
           </Button>
         </div>
         <div className="chat-history-list">
-          <p className="side-section">Recent tickets</p>
-          {recentTickets.length ? (
-            recentTickets.map((ticket) => (
-              <button className="history-item" key={ticket.id} onClick={() => onTicketSelect(ticket.id)}>
-                <span>{ticket.title}</span>
-                <small>#{ticket.id} / {formatTime(ticket.updated_at)}</small>
+          {threads.length ? (
+            threads.map((thread) => (
+              <button
+                className={`history-item${thread.thread_id === conversationId ? " active" : ""}`}
+                key={thread.thread_id}
+                onClick={() => loadThread(thread.thread_id)}
+              >
+                <span className="history-item-preview">
+                  <MessageSquare size={13} aria-hidden="true" />
+                  {thread.preview || "Conversation"}
+                </span>
+                <small>{thread.last_at ? formatTime(thread.last_at) : ""}</small>
               </button>
             ))
           ) : (
-            <p className="muted-text padded">No tickets loaded.</p>
+            <p className="muted-text padded">No past conversations.</p>
           )}
+          {recentTickets.length ? (
+            <>
+              <p className="side-section">Recent tickets</p>
+              {recentTickets.map((ticket) => (
+                <button className="history-item" key={ticket.id} onClick={() => onTicketSelect(ticket.id)}>
+                  <span>{ticket.title}</span>
+                  <small>#{ticket.id} / {formatTime(ticket.updated_at)}</small>
+                </button>
+              ))}
+            </>
+          ) : null}
         </div>
       </aside>
       <div className="chat-main">
@@ -227,4 +300,50 @@ export function AssistantPage({
       </div>
     </section>
   );
+}
+
+function defaultThreadId(user: ApiUser | null): string {
+  return `user:${user?.id ?? "anonymous"}:default`;
+}
+
+function newThreadId(user: ApiUser | null): string {
+  return `user:${user?.id ?? "anonymous"}:${generateId("chat")}`;
+}
+
+function threadStorageKey(user: ApiUser | null): string {
+  return `capstone-its-chat-thread:${user?.id ?? "anonymous"}`;
+}
+
+function readThreadId(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function rememberThreadId(key: string, threadId: string) {
+  try {
+    window.localStorage.setItem(key, threadId);
+  } catch {
+    // Storage can be unavailable in private browsing modes.
+  }
+}
+
+function defaultAssistantMessage(content = defaultAssistantText): ChatMessage {
+  return {
+    id: generateId("msg"),
+    role: "assistant",
+    content,
+    createdAt: new Date().toISOString()
+  };
+}
+
+function historyMessageToChatMessage(message: ChatHistoryMessage, index: number): ChatMessage {
+  return {
+    id: message.id || `history-${index}`,
+    role: message.role,
+    content: message.content,
+    createdAt: message.created_at || new Date().toISOString()
+  };
 }

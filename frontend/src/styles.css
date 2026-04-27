@@ -1117,6 +1117,27 @@ input:disabled {
   background: var(--bg-subtle);
 }
 
+.history-item.active {
+  background: var(--bg-subtle);
+  box-shadow: inset 2px 0 0 var(--accent, #2563eb);
+}
+
+.history-item-preview {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.82rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item-preview svg {
+  flex-shrink: 0;
+  color: var(--text-soft);
+}
+
 .history-item span {
   overflow: hidden;
   color: var(--text);
