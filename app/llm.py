@@ -14,6 +14,7 @@ load_dotenv()
 
 def get_chat_model(settings: Settings | None = None) -> BaseChatModel:
     settings = settings or get_settings()
+    settings.configure_langsmith_environment()
     provider = settings.llm_provider.casefold()
 
     if provider == "openai":
@@ -41,6 +42,7 @@ def _cached_huggingface_embeddings(model_name: str) -> HuggingFaceEmbeddings:
 
 def get_embedding_model(settings: Settings | None = None) -> Embeddings:
     settings = settings or get_settings()
+    settings.configure_langsmith_environment()
     provider = settings.embedding_provider.casefold()
 
     if provider == "openai":

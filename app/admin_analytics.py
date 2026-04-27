@@ -329,7 +329,13 @@ def run_admin_analytics_question(
         graph = _get_analytics_graph()
         state = graph.invoke(
             {"messages": [HumanMessage(content=clean_question)]},
-            config={"recursion_limit": 5},  # agent→tools→agent→tools→agent = 5 max
+            config=_analytics_invoke_config(
+                run_name="admin_analytics_graph",
+                project_id=project_id,
+                recursion_limit=5,
+                tags=["analytics", "langgraph", "graph"],
+                path="graph",
+            ),  # agent→tools→agent→tools→agent = 5 max
         )
         answer = _final_message_text(state.get("messages", []))
         if answer and not trace["tools"] and _requires_grounding(clean_question):
@@ -354,6 +360,32 @@ def run_admin_analytics_question(
         _ANALYTICS_SCOPE.reset(scope_token)
 
 
+def _analytics_invoke_config(
+    *,
+    run_name: str,
+    project_id: int | None,
+    tags: list[str],
+    path: str,
+    recursion_limit: int | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "component": "admin_analytics",
+        "path": path,
+        "project_scoped": project_id is not None,
+    }
+    if project_id is not None:
+        metadata["project_id"] = project_id
+
+    config: dict[str, Any] = {
+        "run_name": run_name,
+        "tags": tags,
+        "metadata": metadata,
+    }
+    if recursion_limit is not None:
+        config["recursion_limit"] = recursion_limit
+    return config
+
+
 def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
     trace["path"] = "sql_agent_fallback"
     # Inject scope hint so the SQL agent respects the project filter.
@@ -363,7 +395,16 @@ def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
         scoped_question = f"{clean_question} [Mandatory filter: project_id = {scope['project_id']}]"
 
     agent = _get_sql_agent()
-    result = agent.invoke({"input": scoped_question})
+    result = agent.invoke(
+        {"input": scoped_question},
+        config=_analytics_invoke_config(
+            run_name="admin_analytics_sql_fallback",
+            project_id=scope.get("project_id"),
+            tags=["analytics", "sql-agent", "fallback"],
+            path="sql_fallback",
+        ),
+    )
+
     output = result.get("output") if isinstance(result, dict) else result
     answer = str(output or "No answer was generated.").strip()
     if isinstance(result, dict):

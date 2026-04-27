@@ -1,4 +1,5 @@
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -49,6 +50,11 @@ class Settings(BaseSettings):
         default=Path("./data/langgraph_checkpoints.sqlite"),
         alias="LANGGRAPH_CHECKPOINT_PATH",
     )
+    langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
+    langsmith_api_key: str | None = Field(default=None, alias="LANGSMITH_API_KEY")
+    langsmith_project: str | None = Field(default=None, alias="LANGSMITH_PROJECT")
+    langsmith_endpoint: str | None = Field(default=None, alias="LANGSMITH_ENDPOINT")
+    langsmith_workspace_id: str | None = Field(default=None, alias="LANGSMITH_WORKSPACE_ID")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
@@ -91,6 +97,23 @@ class Settings(BaseSettings):
     def ensure_local_dirs(self) -> None:
         self.kb_dir.mkdir(parents=True, exist_ok=True)
         self.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def configure_langsmith_environment(self) -> None:
+        if not self.langsmith_tracing:
+            return
+
+        os.environ["LANGSMITH_TRACING"] = "true"
+        # Backward-compatible alias used by some LangChain/LangGraph integrations.
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+
+        if self.langsmith_api_key:
+            os.environ["LANGSMITH_API_KEY"] = self.langsmith_api_key
+        if self.langsmith_project:
+            os.environ["LANGSMITH_PROJECT"] = self.langsmith_project
+        if self.langsmith_endpoint:
+            os.environ["LANGSMITH_ENDPOINT"] = self.langsmith_endpoint
+        if self.langsmith_workspace_id:
+            os.environ["LANGSMITH_WORKSPACE_ID"] = self.langsmith_workspace_id
 
 
 @lru_cache(maxsize=1)

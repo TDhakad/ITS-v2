@@ -153,7 +153,9 @@ class TicketCreateRequest(BaseModel):
 
 @app.on_event("startup")
 def startup() -> None:
-    get_settings().ensure_local_dirs()
+    settings = get_settings()
+    settings.ensure_local_dirs()
+    settings.configure_langsmith_environment()
     _ensure_db()
 
 

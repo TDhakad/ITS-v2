@@ -591,6 +591,36 @@ def get_helpdesk_graph():
     return build_helpdesk_graph(checkpointer=sqlite_checkpointer())
 
 
+def _chat_invoke_config(
+    *,
+    thread_id: str,
+    user_role: str,
+    clearance: UserClearance,
+    project_id: int | None,
+) -> dict[str, Any]:
+    tags = ["assistant", "langgraph", "chat-turn"]
+    if project_id is not None:
+        tags.append("project-scoped")
+
+    metadata: dict[str, Any] = {
+        "component": "helpdesk_assistant",
+        "thread_id": thread_id,
+        "user_role": user_role,
+        "clearance": clearance.value,
+        "project_scoped": project_id is not None,
+    }
+    if project_id is not None:
+        metadata["project_id"] = project_id
+
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": 15,
+        "run_name": "helpdesk_chat_turn",
+        "tags": tags,
+        "metadata": metadata,
+    }
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 def run_chat_turn(
@@ -604,8 +634,10 @@ def run_chat_turn(
     project_id: int | None = None,
     project_ids: list[int] | None = None,
     display_name: str = "User",
-    user_role: str = UserRole.USER,
+    user_role: str = UserRole.USER.value,
 ) -> ChatTurnResult:
+    resolved_user_role = str(user_role)
+
     # Set per-request context — mutable dict shared with tools.
     ctx: dict[str, Any] = {
         "user_id": user_id,
@@ -616,7 +648,7 @@ def run_chat_turn(
         "project_id": project_id,
         "project_ids": project_ids,
         "display_name": display_name,
-        "user_role": user_role,
+        "user_role": resolved_user_role,
         "kb_refs": [],
         "ticket_id": None,
         "messages_snapshot": [],
@@ -633,10 +665,12 @@ def run_chat_turn(
             "environment": environment,
             "user_clearance": clearance,
         },
-        config={
-            "configurable": {"thread_id": thread_id},
-            "recursion_limit": 15,
-        },
+        config=_chat_invoke_config(
+            thread_id=thread_id,
+            user_role=resolved_user_role,
+            clearance=clearance,
+            project_id=project_id,
+        ),
     )
 
     # Find the last non-tool-call AI message — that's what the user sees.
