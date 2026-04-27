@@ -287,7 +287,13 @@ export default function App() {
         loadState={state.selectedState}
         error={state.selectedError}
         aiOpen={state.aiOpen}
+        user={state.user}
+        tickets={state.tickets}
+        projects={state.projects}
+        activeProjectId={state.activeProjectId}
         onBack={() => navigate("/")}
+        onProjectChange={(projectId) => dispatch({ type: "project-select", projectId })}
+        onViewChange={(view) => navigate(view === "assistant" ? "/assistant" : "/")}
         onToggleAi={() => dispatch({ type: "ai-toggle" })}
         onTicketSelect={selectTicket}
       />

@@ -1,13 +1,24 @@
 import {
+  Activity,
   ArrowLeft,
+  Bot,
+  Bug,
   FileText,
+  FolderKanban,
+  HardDrive,
+  LayoutDashboard,
   Link2,
+  List,
   MessageSquare,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Server,
   ShieldCheck,
   Sparkles,
+  TrendingUp,
   X
 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { api } from "../api/client";
 import {
   formatDateTime,
@@ -19,7 +30,7 @@ import {
   parseTicketIdFromText,
   cx
 } from "../lib";
-import type { LoadState, Ticket, TicketInsight } from "../types";
+import type { ApiUser, LoadState, ProjectSummary, Ticket, TicketInsight } from "../types";
 import { Button, EmptyState, IconButton, LoadingState, PriorityBadge, StatusBadge } from "./common";
 import { MarkdownContent } from "./MarkdownContent";
 
@@ -28,7 +39,13 @@ interface TicketDetailProps {
   loadState: LoadState;
   error?: string | null;
   aiOpen: boolean;
+  user: ApiUser | null;
+  tickets: Ticket[];
+  projects: ProjectSummary[];
+  activeProjectId: number | null;
   onBack: () => void;
+  onProjectChange: (projectId: number | null) => void;
+  onViewChange: (view: "dashboard" | "assistant") => void;
   onToggleAi: () => void;
   onTicketSelect: (ticketId: number) => void;
 }
@@ -38,13 +55,66 @@ export function TicketDetail({
   loadState,
   error,
   aiOpen,
+  user,
+  tickets,
+  projects,
+  activeProjectId,
   onBack,
+  onProjectChange,
+  onViewChange,
   onToggleAi,
   onTicketSelect
 }: TicketDetailProps) {
   const [insight, setInsight] = useState<TicketInsight | null>(null);
   const [insightState, setInsightState] = useState<LoadState>("idle");
   const [insightError, setInsightError] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [insightWidth, setInsightWidth] = useState(352);
+  const [isResizingDrawer, setIsResizingDrawer] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+    typeof window === "undefined" ? 1280 : window.innerWidth
+  );
+  const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const canResizeInsights = viewportWidth > 980;
+  const counts = countTicketsForSidebar(tickets, user);
+
+  useEffect(() => {
+    function handleViewportResize() {
+      setViewportWidth(window.innerWidth);
+    }
+
+    window.addEventListener("resize", handleViewportResize);
+    return () => window.removeEventListener("resize", handleViewportResize);
+  }, []);
+
+  useEffect(() => {
+    if (!isResizingDrawer) {
+      return;
+    }
+
+    function onMouseMove(event: MouseEvent) {
+      const dragState = dragStateRef.current;
+      if (!dragState) {
+        return;
+      }
+      const delta = dragState.startX - event.clientX;
+      const maxWidth = Math.max(360, viewportWidth - (sidebarOpen ? 560 : 430));
+      setInsightWidth(clamp(dragState.startWidth + delta, 280, maxWidth));
+    }
+
+    function onMouseUp() {
+      dragStateRef.current = null;
+      setIsResizingDrawer(false);
+    }
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [isResizingDrawer, sidebarOpen, viewportWidth]);
 
   useEffect(() => {
     if (!aiOpen) {
@@ -78,9 +148,150 @@ export function TicketDetail({
 
   const messages = ticket.conversation ?? ticket.messages ?? [];
 
+  function startDrawerResize(event: ReactMouseEvent<HTMLButtonElement>) {
+    if (!canResizeInsights) {
+      return;
+    }
+    event.preventDefault();
+    dragStateRef.current = {
+      startX: event.clientX,
+      startWidth: insightWidth,
+    };
+    setIsResizingDrawer(true);
+  }
+
   return (
-    <section className="ticket-detail-page" aria-label="Ticket detail">
-      <div className={cx("ticket-detail-main", aiOpen && "is-shifted")}>
+    <section className={cx("ticket-detail-page", isResizingDrawer && "is-resizing")} aria-label="Ticket detail">
+      <aside className={cx("ops-sidebar", "detail-sidebar", !sidebarOpen && "is-collapsed")}>
+        <div className="detail-sidebar-header">
+          <div className="ops-logo">
+            <div className="ops-logo-icon">IT</div>
+            <span className="ops-logo-name">Ops Console</span>
+          </div>
+          <IconButton
+            className="detail-sidebar-toggle"
+            onClick={() => setSidebarOpen((current) => !current)}
+            aria-label={sidebarOpen ? "Collapse left sidebar" : "Expand left sidebar"}
+            title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+            type="button"
+          >
+            {sidebarOpen ? <PanelLeftClose size={15} aria-hidden="true" /> : <PanelLeftOpen size={15} aria-hidden="true" />}
+          </IconButton>
+        </div>
+
+        <div className="ops-main-nav">
+          <button className="ops-main-nav-item is-active" onClick={() => onViewChange("dashboard")}>
+            <LayoutDashboard size={15} aria-hidden="true" />
+            Dashboard
+          </button>
+          <button className="ops-main-nav-item" onClick={() => onViewChange("assistant")}>
+            <Bot size={15} aria-hidden="true" />
+            AI Assistant
+          </button>
+        </div>
+
+        <div className="ops-divider" />
+
+        <p className="ops-section-label">Projects</p>
+        <div className="ops-section-list">
+          {user?.role === "admin" ? (
+            <button
+              className={cx("ops-project-item", activeProjectId === null && "is-active")}
+              onClick={() => {
+                onProjectChange(null);
+                onBack();
+              }}
+            >
+              <span className="ops-project-dot" aria-hidden="true" />
+              <span>All projects</span>
+            </button>
+          ) : null}
+          {projects.map((project) => (
+            <button
+              className={cx("ops-project-item", activeProjectId === project.id && "is-active")}
+              key={project.id}
+              onClick={() => {
+                onProjectChange(project.id);
+                onBack();
+              }}
+            >
+              <span className="ops-project-dot" aria-hidden="true" />
+              <span>{project.name}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="ops-divider" />
+
+        <p className="ops-section-label">Workspace</p>
+        <div className="ops-section-list">
+          <button className="ops-side-row is-active" onClick={onBack}>
+            <span className="ops-side-left">
+              <List size={14} aria-hidden="true" />
+              <span>All tickets</span>
+            </span>
+            <span className="ops-side-count">{tickets.length}</span>
+          </button>
+          <button className="ops-side-row" onClick={onBack}>
+            <span className="ops-side-left">
+              <FolderKanban size={14} aria-hidden="true" />
+              <span>My queue</span>
+            </span>
+            <span className="ops-side-count">{counts.mine}</span>
+          </button>
+          <button className="ops-side-row" onClick={onBack}>
+            <span className="ops-side-left">
+              <TrendingUp size={14} aria-hidden="true" />
+              <span>Reports</span>
+            </span>
+          </button>
+        </div>
+
+        <div className="ops-divider" />
+
+        <p className="ops-section-label">Categories</p>
+        <div className="ops-section-list">
+          <button className="ops-side-row" onClick={onBack}>
+            <span className="ops-side-left">
+              <Server size={14} aria-hidden="true" />
+              <span>Infrastructure</span>
+            </span>
+            <span className="ops-side-count">{counts.byCategory.Infra ?? 0}</span>
+          </button>
+          <button className="ops-side-row" onClick={onBack}>
+            <span className="ops-side-left">
+              <Bug size={14} aria-hidden="true" />
+              <span>Bugs</span>
+            </span>
+            <span className="ops-side-count">{counts.byCategory.Bug ?? 0}</span>
+          </button>
+          <button className="ops-side-row" onClick={onBack}>
+            <span className="ops-side-left">
+              <Activity size={14} aria-hidden="true" />
+              <span>UI</span>
+            </span>
+            <span className="ops-side-count">{counts.byCategory.UI ?? 0}</span>
+          </button>
+          <button className="ops-side-row" onClick={onBack}>
+            <span className="ops-side-left">
+              <HardDrive size={14} aria-hidden="true" />
+              <span>Hardware</span>
+            </span>
+            <span className="ops-side-count">{counts.byCategory.Hardware ?? 0}</span>
+          </button>
+        </div>
+
+        <div className="ops-user-block">
+          <strong>{user?.display_name ?? "User"}</strong>
+          <small>{user?.email ?? "Not signed in"}</small>
+        </div>
+      </aside>
+
+      <div className="ticket-detail-content">
+        <div
+          className={cx("ticket-detail-main", aiOpen && "is-shifted")}
+          style={aiOpen && canResizeInsights ? { marginRight: `${insightWidth}px` } : undefined}
+        >
         <header className="detail-topbar">
           <button className="back-button" onClick={onBack}>
             <ArrowLeft size={15} aria-hidden="true" />
@@ -221,16 +432,21 @@ export function TicketDetail({
             ) : null}
           </div>
         )}
+        </div>
+        <InsightsDrawer
+          open={aiOpen}
+          width={canResizeInsights ? insightWidth : undefined}
+          resizable={canResizeInsights}
+          resizing={isResizingDrawer}
+          ticket={ticket}
+          insight={insight}
+          state={insightState}
+          error={insightError}
+          onClose={onToggleAi}
+          onResizeStart={startDrawerResize}
+          onTicketSelect={onTicketSelect}
+        />
       </div>
-      <InsightsDrawer
-        open={aiOpen}
-        ticket={ticket}
-        insight={insight}
-        state={insightState}
-        error={insightError}
-        onClose={onToggleAi}
-        onTicketSelect={onTicketSelect}
-      />
     </section>
   );
 }
@@ -246,19 +462,27 @@ function Meta({ label, value }: { label: string; value: ReactNode }) {
 
 function InsightsDrawer({
   open,
+  width,
+  resizable,
+  resizing,
   ticket,
   insight,
   state,
   error,
   onClose,
+  onResizeStart,
   onTicketSelect
 }: {
   open: boolean;
+  width?: number;
+  resizable: boolean;
+  resizing: boolean;
   ticket: Ticket;
   insight: TicketInsight | null;
   state: LoadState;
   error: string | null;
   onClose: () => void;
+  onResizeStart: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   onTicketSelect: (id: number) => void;
 }) {
   const fixes = insight?.suggested_fixes?.length
@@ -267,7 +491,19 @@ function InsightsDrawer({
   const signals = insight?.signals?.length ? insight.signals : [ticket.category, ticket.environment, ...ticket.keywords];
 
   return (
-    <aside className={cx("insights-drawer", open && "is-open")} aria-label="AI insights">
+    <aside
+      className={cx("insights-drawer", open && "is-open")}
+      aria-label="AI insights"
+      style={width ? { width: `${width}px` } : undefined}
+    >
+      {resizable ? (
+        <button
+          type="button"
+          className={cx("drawer-resize-handle", resizing && "is-active")}
+          aria-label="Resize AI insights panel"
+          onMouseDown={onResizeStart}
+        />
+      ) : null}
       <div className="drawer-header">
         <span className="live-dot" />
         <strong>AI insights</strong>
@@ -367,4 +603,24 @@ function DrawerBlock({ title, children }: { title: string; children: ReactNode }
       <div>{children}</div>
     </section>
   );
+}
+
+function countTicketsForSidebar(tickets: Ticket[], user: ApiUser | null) {
+  return tickets.reduce(
+    (acc, current) => {
+      if (user && current.user_id === String(user.id)) {
+        acc.mine += 1;
+      }
+      acc.byCategory[current.category] = (acc.byCategory[current.category] ?? 0) + 1;
+      return acc;
+    },
+    {
+      mine: 0,
+      byCategory: {} as Partial<Record<Ticket["category"], number>>,
+    }
+  );
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(value, minimum), maximum);
 }

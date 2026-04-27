@@ -1,5 +1,13 @@
 import { Bot, FileText, MessageSquare, Plus, Send, Shield, Ticket as TicketIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent
+} from "react";
 import { api } from "../api/client";
 import { formatTime, generateId, kbReferenceHref } from "../lib";
 import type { ApiUser, ChatHistoryMessage, ChatMessage, ChatThread, LoadState, Ticket } from "../types";
@@ -37,6 +45,7 @@ export function AssistantPage({
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [threads, setThreads] = useState<ChatThread[]>([]);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
 
   const recentTickets = useMemo(() => tickets.slice(0, 6), [tickets]);
 
@@ -48,6 +57,19 @@ export function AssistantPage({
   useEffect(() => {
     refreshThreads();
   }, [refreshThreads]);
+
+  const scrollMessageListToBottom = useCallback(() => {
+    const listElement = messageListRef.current;
+    if (!listElement) {
+      return;
+    }
+    listElement.scrollTop = listElement.scrollHeight;
+  }, []);
+
+  useEffect(() => {
+    const rafId = window.requestAnimationFrame(scrollMessageListToBottom);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [conversationId, messages.length, state, scrollMessageListToBottom]);
 
   useEffect(() => {
     let active = true;
@@ -167,6 +189,17 @@ export function AssistantPage({
     }
   }
 
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+    event.preventDefault();
+    if (!input.trim() || state === "loading") {
+      return;
+    }
+    void submitMessage(input);
+  }
+
   return (
     <section className="assistant-page" aria-label="AI assistant">
       <aside className="chat-history">
@@ -226,7 +259,7 @@ export function AssistantPage({
             {tickets.length} tickets in context
           </span>
         </header>
-        <div className="message-list" aria-live="polite">
+        <div className="message-list" aria-live="polite" ref={messageListRef}>
           {messages.map((message) => (
             <article className={`bubble-row ${message.role === "user" ? "mine" : "assistant"}`} key={message.id}>
               <div className={`bubble ${message.role === "user" ? "mine" : "ai"}`}>
@@ -292,6 +325,7 @@ export function AssistantPage({
               rows={1}
               value={input}
               onChange={(event) => setInput(event.target.value)}
+              onKeyDown={handleComposerKeyDown}
               placeholder="Ask anything about tickets, runbooks, or access requests"
             />
             <Button

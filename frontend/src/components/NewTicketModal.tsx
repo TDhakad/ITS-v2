@@ -73,15 +73,20 @@ export function NewTicketModal({ open, user, projectId, onClose, onCreated }: Ne
   }
 
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal wide" role="dialog" aria-modal="true" aria-labelledby="new-ticket-title">
-        <header className="modal-header">
+    <div className="modal-backdrop ticket-modal-backdrop" role="presentation">
+      <section
+        className="modal wide ticket-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-ticket-title"
+      >
+        <header className="modal-header ticket-modal-header">
           <h2 id="new-ticket-title">New ticket</h2>
           <IconButton aria-label="Close new ticket" onClick={onClose}>
             <X size={16} aria-hidden="true" />
           </IconButton>
         </header>
-        <form className="stack-form" onSubmit={submit}>
+        <form className="stack-form ticket-modal-form" onSubmit={submit}>
           <label>
             <span>Title</span>
             <input
@@ -154,7 +159,7 @@ export function NewTicketModal({ open, user, projectId, onClose, onCreated }: Ne
             />
           </label>
           <FieldError message={error} />
-          <div className="modal-actions">
+          <div className="modal-actions ticket-modal-actions">
             <Button onClick={onClose}>Cancel</Button>
             <Button type="submit" variant="primary" disabled={state === "loading" || !description.trim()}>
               {state === "loading" ? "Creating" : "Create ticket"}
