@@ -32,7 +32,6 @@ except Exception:  # pragma: no cover
 
 from app.db import (
     SessionLocal,
-    find_duplicate_candidates,
 )
 from app.db import (
     create_ticket as _db_create_ticket,
@@ -351,7 +350,6 @@ def create_helpdesk_ticket(
             if hasattr(m, "content") and m.content and m.type in ("human", "ai")
         ]
         with SessionLocal() as db:
-            duplicates = find_duplicate_candidates(db, keywords[:12], limit=5)
             ticket = _db_create_ticket(
                 db,
                 TicketCreate(
@@ -369,17 +367,13 @@ def create_helpdesk_ticket(
                         keywords=keywords[:12],
                         confidence=0.85,
                     ),
-                    resolution=ResolutionData(
-                        linked_kb_articles=ctx.get("kb_refs", []),
-                        duplicate_ticket_ids=[int(d["ticket_id"]) for d in duplicates],
-                    ),
+                    resolution=ResolutionData(),
                     conversation=conversation,
                 ),
             )
         ctx["ticket_id"] = ticket.id
-        dup_note = f" ({len(duplicates)} similar ticket(s) found)" if duplicates else ""
         return (
-            f"Ticket #{ticket.id} created successfully{dup_note}. "
+            f"Ticket #{ticket.id} created successfully. "
             f"Category: {category}, Priority: {priority}. "
             "The helpdesk team will review and follow up with you."
         )
@@ -408,6 +402,7 @@ Tool guidance — pick exactly one per turn based on the user's intent:
 - create_helpdesk_ticket: issue needs human intervention, privileged access, hardware replacement, or the user explicitly asks. Always include impact-area tags: ui, hardware, access, infra, security, network, performance, data.
 
 Ask follow-up questions when you need the app name, error message, or affected scope.
+When referencing existing tickets in responses, format them as markdown links using the app route: [#123](/tickets/123).
 If the KB has no answer, check similar past tickets before creating a new one."""
 
 

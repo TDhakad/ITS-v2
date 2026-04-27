@@ -1293,6 +1293,55 @@ input:disabled {
   font-weight: 650;
 }
 
+/* Inline ticket reference rendered by MarkdownContent inside AI bubbles */
+.inline-ticket-link {
+  display: inline;
+  padding: 1px 5px;
+  border: 1px solid var(--primary-soft);
+  border-radius: 5px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 0.82em;
+  font-weight: 650;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.12s;
+}
+.inline-ticket-link:hover {
+  background: #d3e0ff;
+}
+
+/* KB / doc reference chips that are actual links */
+a.kb-link.reference-chip,
+a.kb-link.source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  text-decoration: none;
+  color: var(--primary);
+  background: var(--primary-soft);
+  border-color: #c7d8ff;
+  transition: background 0.12s;
+}
+a.kb-link.reference-chip:hover,
+a.kb-link.source-chip:hover {
+  background: #d3e0ff;
+}
+
+/* Duplicate ticket reference chips — look like chips but are buttons */
+button.ticket-ref-chip {
+  cursor: pointer;
+  color: var(--primary);
+  background: var(--primary-soft);
+  border-color: #c7d8ff;
+  font-weight: 700;
+  transition: background 0.12s;
+}
+button.ticket-ref-chip:hover {
+  background: #d3e0ff;
+}
+
 .suggestion-row {
   display: flex;
   flex-wrap: wrap;

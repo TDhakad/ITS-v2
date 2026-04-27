@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { EmptyState, LoadingState, PriorityBadge } from "./common";
-import type { ApiUser, LoadState, Ticket, TicketCategory } from "../types";
+import type { ApiUser, LoadState, ProjectSummary, Ticket, TicketCategory } from "../types";
 import { cx, formatTime, initials, statusGroup, ticketSearchBlob } from "../lib";
 
 type SideFilter = "all" | "mine" | "Infra" | "Bug" | "UI" | "Hardware" | "Feature";
@@ -23,11 +23,14 @@ const columns: Array<{ key: "open" | "pending" | "resolved"; title: string; tone
 
 interface TicketBoardProps {
   tickets: Ticket[];
+  projects: ProjectSummary[];
+  activeProjectId: number | null;
   loadState: LoadState;
   error?: string | null;
   search: string;
   filter: SideFilter;
   user: ApiUser | null;
+  onProjectChange: (projectId: number | null) => void;
   onSearchChange: (value: string) => void;
   onFilterChange: (value: SideFilter) => void;
   onTicketSelect: (ticketId: number) => void;
@@ -37,11 +40,14 @@ interface TicketBoardProps {
 
 export function TicketBoard({
   tickets,
+  projects,
+  activeProjectId,
   loadState,
   error,
   search,
   filter,
   user,
+  onProjectChange,
   onSearchChange,
   onFilterChange,
   onTicketSelect,
@@ -59,6 +65,25 @@ export function TicketBoard({
     <section className="dashboard-page" aria-label="Ticket dashboard">
       <aside className="dashboard-sidebar">
         <div className="side-nav">
+          <p className="side-section">Projects</p>
+          {user?.role === "admin" ? (
+            <SideItem
+              active={activeProjectId === null}
+              icon={<FolderKanban size={15} aria-hidden="true" />}
+              label="All projects"
+              onClick={() => onProjectChange(null)}
+            />
+          ) : null}
+          {projects.map((project) => (
+            <SideItem
+              key={project.id}
+              active={activeProjectId === project.id}
+              icon={<FolderKanban size={15} aria-hidden="true" />}
+              label={project.name}
+              onClick={() => onProjectChange(project.id)}
+            />
+          ))}
+
           <p className="side-section">Workspace</p>
           <SideItem
             active={filter === "all"}
@@ -240,7 +265,10 @@ function countTickets(tickets: Ticket[], user: ApiUser | null) {
       acc.byCategory[ticket.category] = (acc.byCategory[ticket.category] ?? 0) + 1;
       return acc;
     },
-    { mine: 0, byCategory: {} as Partial<Record<TicketCategory, number>> }
+    {
+      mine: 0,
+      byCategory: {} as Partial<Record<TicketCategory, number>>,
+    }
   );
 }
 

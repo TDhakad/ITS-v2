@@ -1,7 +1,7 @@
 import { Bot, FileText, MessageSquare, Plus, Send, Shield, Ticket as TicketIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { api } from "../api/client";
-import { formatTime, generateId, initials } from "../lib";
+import { formatTime, generateId, initials, kbReferenceHref } from "../lib";
 import type { ApiUser, ChatHistoryMessage, ChatMessage, ChatThread, LoadState, Ticket } from "../types";
 import { Button, EmptyState, LoadingState } from "./common";
 import { MarkdownContent } from "./MarkdownContent";
@@ -9,6 +9,7 @@ import { MarkdownContent } from "./MarkdownContent";
 interface AssistantPageProps {
   tickets: Ticket[];
   user: ApiUser | null;
+  projectId: number | null;
   onTicketCreated: (ticket: Ticket) => void;
   onTicketSelect: (ticketId: number) => void;
 }
@@ -26,6 +27,7 @@ const defaultAssistantText =
 export function AssistantPage({
   tickets,
   user,
+  projectId,
   onTicketCreated,
   onTicketSelect
 }: AssistantPageProps) {
@@ -126,7 +128,8 @@ export function AssistantPage({
         thread_id: conversationId,
         user_id: user ? String(user.id) : "anonymous",
         environment: "unknown",
-        clearance: user?.clearance ?? "public"
+        clearance: user?.clearance ?? "public",
+        project_id: projectId
       });
 
       if (response.ticket) {
@@ -229,14 +232,31 @@ export function AssistantPage({
                 {message.role === "user" ? initials(user?.display_name, "U") : "AI"}
               </span>
               <div className={`bubble ${message.role === "user" ? "mine" : "ai"}`}>
-                <MarkdownContent content={message.content} />
+                <MarkdownContent
+                  content={message.content}
+                  onTicketSelect={onTicketSelect}
+                />
                 {message.citations?.length ? (
                   <div className="source-row">
-                    {message.citations.slice(0, 4).map((citation) => (
-                      <span className="source-chip" key={citation.kb_id ?? citation.title ?? citation.source}>
-                        {citation.title ?? citation.source ?? "Reference"}
-                      </span>
-                    ))}
+                    {message.citations.slice(0, 4).map((citation) => {
+                      const label = citation.title ?? citation.source ?? "Reference";
+                      const href = kbReferenceHref(citation);
+                      return href ? (
+                        <a
+                          className="source-chip kb-link"
+                          href={href}
+                          target="_blank"
+                          rel="noreferrer"
+                          key={citation.kb_id ?? citation.title ?? citation.source}
+                        >
+                          {label}
+                        </a>
+                      ) : (
+                        <span className="source-chip" key={citation.kb_id ?? citation.title ?? citation.source}>
+                          {label}
+                        </span>
+                      );
+                    })}
                   </div>
                 ) : null}
                 {message.ticket ? (

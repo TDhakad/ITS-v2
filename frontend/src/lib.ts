@@ -1,4 +1,7 @@
-import type { Priority, Ticket, TicketStatus } from "./types";
+import type { KBReference, Priority, Ticket, TicketStatus } from "./types";
+
+const TICKET_REF_RE = /#\s*(\d+)/i;
+const TICKET_PATH_RE = /\/(?:api\/)?tickets\/(\d+)(?:[/?#]|$)/i;
 
 export const STATUS_LABELS: Record<TicketStatus, string> = {
   open: "Open",
@@ -111,4 +114,79 @@ export function generateId(prefix: string): string {
     return `${prefix}-${window.crypto.randomUUID()}`;
   }
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+export function parseTicketIdFromText(value: string | undefined | null): number | null {
+  if (!value) {
+    return null;
+  }
+  const match = value.match(TICKET_REF_RE);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function parseTicketIdFromHref(href: string | undefined | null): number | null {
+  if (!href) {
+    return null;
+  }
+
+  const trimmed = href.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const ticketSchemeMatch = trimmed.match(/^ticket:\/\/(\d+)$/i);
+  if (ticketSchemeMatch) {
+    const parsed = Number.parseInt(ticketSchemeMatch[1], 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  try {
+    const base = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+    const parsedUrl = new URL(trimmed, base);
+    if (typeof window !== "undefined" && parsedUrl.origin !== window.location.origin) {
+      return null;
+    }
+
+    const queryTicketId = parsedUrl.searchParams.get("ticket") ?? parsedUrl.searchParams.get("ticket_id");
+    if (queryTicketId) {
+      const parsed = Number.parseInt(queryTicketId, 10);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+
+    const pathMatch = parsedUrl.pathname.match(TICKET_PATH_RE);
+    if (pathMatch) {
+      const parsed = Number.parseInt(pathMatch[1], 10);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    return parseTicketIdFromText(parsedUrl.hash);
+  } catch {
+    return null;
+  }
+}
+
+export function kbReferenceHref(reference: KBReference): string | null {
+  const source = reference.source?.trim();
+  if (source) {
+    if (/^https?:\/\//i.test(source)) {
+      return source;
+    }
+    const params = new URLSearchParams({ source });
+    if (reference.kb_id) {
+      params.set("kb_id", reference.kb_id);
+    }
+    return `/api/kb/doc?${params.toString()}`;
+  }
+
+  if (reference.kb_id) {
+    return `/api/kb/doc?kb_id=${encodeURIComponent(reference.kb_id)}`;
+  }
+
+  return null;
 }

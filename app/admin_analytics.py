@@ -38,8 +38,6 @@ logger = logging.getLogger("uvicorn.error")
 READ_ONLY_TABLES = [
     "tickets",
     "ticket_messages",
-    "ticket_kb_links",
-    "duplicate_ticket_links",
     "ticket_tags",
     "tags",
     "users",

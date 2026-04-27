@@ -15,6 +15,8 @@ import {
   initials,
   STATUS_LABELS,
   ticketDescription,
+  kbReferenceHref,
+  parseTicketIdFromText,
   cx
 } from "../lib";
 import type { LoadState, Ticket, TicketInsight } from "../types";
@@ -28,6 +30,7 @@ interface TicketDetailProps {
   aiOpen: boolean;
   onBack: () => void;
   onToggleAi: () => void;
+  onTicketSelect: (ticketId: number) => void;
 }
 
 export function TicketDetail({
@@ -36,7 +39,8 @@ export function TicketDetail({
   error,
   aiOpen,
   onBack,
-  onToggleAi
+  onToggleAi,
+  onTicketSelect
 }: TicketDetailProps) {
   const [insight, setInsight] = useState<TicketInsight | null>(null);
   const [insightState, setInsightState] = useState<LoadState>("idle");
@@ -116,6 +120,9 @@ export function TicketDetail({
                 <Meta label="Priority" value={<PriorityBadge priority={ticket.priority} />} />
                 <Meta label="Status" value={<StatusBadge status={ticket.status} />} />
                 <Meta label="Category" value={`${ticket.category} / ${ticket.environment}`} />
+                {(ticket.project_name || ticket.project_id) && (
+                  <Meta label="Project" value={ticket.project_name ?? `Project #${ticket.project_id}`} />
+                )}
                 <Meta label="Updated" value={formatDateTime(ticket.updated_at)} />
               </div>
             </section>
@@ -149,7 +156,10 @@ export function TicketDetail({
                         {message.role}
                         <span>{formatTime(message.created_at)}</span>
                       </div>
-                      <MarkdownContent content={message.content} />
+                      <MarkdownContent
+                        content={message.content}
+                        onTicketSelect={onTicketSelect}
+                      />
                     </article>
                   ))
                 ) : (
@@ -165,10 +175,46 @@ export function TicketDetail({
                   Knowledge references
                 </div>
                 <div className="reference-row">
-                  {ticket.linked_kb_articles.slice(0, 4).map((reference) => (
-                    <span className="reference-chip" key={reference.kb_id ?? reference.title}>
-                      {reference.title ?? reference.source}
-                    </span>
+                  {ticket.linked_kb_articles.slice(0, 4).map((reference) => {
+                    const label = reference.title ?? reference.source ?? "Reference";
+                    const href = kbReferenceHref(reference);
+                    return href ? (
+                      <a
+                        className="reference-chip kb-link"
+                        href={href}
+                        target="_blank"
+                        rel="noreferrer"
+                        key={reference.kb_id ?? reference.title}
+                      >
+                        <Link2 size={10} aria-hidden="true" />
+                        {label}
+                      </a>
+                    ) : (
+                      <span className="reference-chip" key={reference.kb_id ?? reference.title}>
+                        {label}
+                      </span>
+                    );
+                  })}
+                </div>
+              </section>
+            ) : null}
+
+            {ticket.duplicate_ticket_ids.length ? (
+              <section className="detail-section">
+                <div className="section-label">
+                  <FileText size={14} aria-hidden="true" />
+                  Possible duplicates
+                </div>
+                <div className="reference-row">
+                  {ticket.duplicate_ticket_ids.map((dupId) => (
+                    <button
+                      key={dupId}
+                      className="reference-chip ticket-ref-chip"
+                      onClick={() => onTicketSelect(dupId)}
+                      type="button"
+                    >
+                      #{dupId}
+                    </button>
                   ))}
                 </div>
               </section>
@@ -183,6 +229,7 @@ export function TicketDetail({
         state={insightState}
         error={insightError}
         onClose={onToggleAi}
+        onTicketSelect={onTicketSelect}
       />
     </section>
   );
@@ -203,7 +250,8 @@ function InsightsDrawer({
   insight,
   state,
   error,
-  onClose
+  onClose,
+  onTicketSelect
 }: {
   open: boolean;
   ticket: Ticket;
@@ -211,6 +259,7 @@ function InsightsDrawer({
   state: LoadState;
   error: string | null;
   onClose: () => void;
+  onTicketSelect: (id: number) => void;
 }) {
   const fixes = insight?.suggested_fixes?.length
     ? insight.suggested_fixes
@@ -233,7 +282,7 @@ function InsightsDrawer({
       ) : (
         <div className="drawer-body">
           <DrawerBlock title="Summary">
-            <MarkdownContent content={insight?.summary ?? ticket.summary} />
+            <MarkdownContent content={insight?.summary ?? ticket.summary} onTicketSelect={onTicketSelect} />
           </DrawerBlock>
           <DrawerBlock title="Recommended actions">
             <div className="action-list">
@@ -249,21 +298,51 @@ function InsightsDrawer({
           </DrawerBlock>
           <DrawerBlock title="Signals">
             <div className="tag-row">
-              {signals.slice(0, 8).map((signal) => (
-                <span className="tag" key={signal}>
-                  {signal}
-                </span>
-              ))}
+              {signals.slice(0, 8).map((signal) => {
+                const maybeTicketId = parseTicketIdFromText(signal);
+                if (maybeTicketId) {
+                  return (
+                    <button
+                      key={signal}
+                      className="reference-chip ticket-ref-chip"
+                      onClick={() => onTicketSelect(maybeTicketId)}
+                      type="button"
+                    >
+                      {signal}
+                    </button>
+                  );
+                }
+                return (
+                  <span className="tag" key={signal}>
+                    {signal}
+                  </span>
+                );
+              })}
             </div>
           </DrawerBlock>
           <DrawerBlock title="References">
             {insight?.citations?.length ? (
               <div className="reference-stack">
-                {insight.citations.slice(0, 3).map((reference) => (
-                  <span className="reference-chip" key={reference.kb_id ?? reference.title}>
-                    {reference.title ?? reference.source}
-                  </span>
-                ))}
+                {insight.citations.slice(0, 3).map((reference) => {
+                  const label = reference.title ?? reference.source ?? "Reference";
+                  const href = kbReferenceHref(reference);
+                  return href ? (
+                    <a
+                      className="reference-chip kb-link"
+                      href={href}
+                      target="_blank"
+                      rel="noreferrer"
+                      key={reference.kb_id ?? reference.title}
+                    >
+                      <Link2 size={10} aria-hidden="true" />
+                      {label}
+                    </a>
+                  ) : (
+                    <span className="reference-chip" key={reference.kb_id ?? reference.title}>
+                      {label}
+                    </span>
+                  );
+                })}
               </div>
             ) : (
               <p>No knowledge references returned.</p>

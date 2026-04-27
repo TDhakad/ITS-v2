@@ -105,8 +105,16 @@ def _create_chat_messages(connection: Connection) -> None:
     )
 
 
+def _drop_deprecated_ticket_link_tables(connection: Connection) -> None:
+    # Dynamic insights replaced persisted ticket_kb_links / duplicate_ticket_links.
+    # Drop legacy tables if they still exist.
+    connection.execute(text("DROP TABLE IF EXISTS ticket_kb_links"))
+    connection.execute(text("DROP TABLE IF EXISTS duplicate_ticket_links"))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     ("0001_initial_schema", _initial_schema),
     ("0002_backfill_ticket_messages", _backfill_ticket_messages),
     ("0003_create_chat_messages", _create_chat_messages),
+    ("0004_drop_deprecated_ticket_link_tables", _drop_deprecated_ticket_link_tables),
 )

@@ -41,7 +41,6 @@ from app.schemas import (
     ChatMessage,
     Environment,
     GuardrailDecision,
-    KBArticleRef,
     Priority,
     ProjectAccessLevel,
     ProjectCreate,
@@ -314,15 +313,6 @@ class TicketRecord(Base):
         cascade="all, delete-orphan",
         order_by="TicketMessageRecord.created_at",
     )
-    kb_links: Mapped[list[TicketKBLinkRecord]] = relationship(
-        back_populates="ticket",
-        cascade="all, delete-orphan",
-    )
-    related_ticket_links: Mapped[list[RelatedTicketLinkRecord]] = relationship(
-        back_populates="ticket",
-        cascade="all, delete-orphan",
-        foreign_keys="RelatedTicketLinkRecord.ticket_id",
-    )
     tag_links: Mapped[list[TicketTagRecord]] = relationship(
         back_populates="ticket",
         cascade="all, delete-orphan",
@@ -343,35 +333,6 @@ class TicketMessageRecord(Base):
     )
 
     ticket: Mapped[TicketRecord] = relationship(back_populates="messages")
-
-
-class TicketKBLinkRecord(Base):
-    __tablename__ = "ticket_kb_links"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
-    kb_id: Mapped[str] = mapped_column(String(255), index=True)
-    title: Mapped[str] = mapped_column(String(300))
-    source: Mapped[str] = mapped_column(String(500))
-    relevance_score: Mapped[float] = mapped_column(Float, default=0.0)
-    clearance: Mapped[str] = mapped_column(String(40), default=UserClearance.PUBLIC.value)
-
-    ticket: Mapped[TicketRecord] = relationship(back_populates="kb_links")
-
-
-class RelatedTicketLinkRecord(Base):
-    __tablename__ = "duplicate_ticket_links"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
-    duplicate_ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), index=True)
-    score: Mapped[float] = mapped_column(Float, default=0.0)
-
-    ticket: Mapped[TicketRecord] = relationship(
-        foreign_keys=[ticket_id],
-        back_populates="related_ticket_links",
-    )
-    duplicate_ticket: Mapped[TicketRecord] = relationship(foreign_keys=[duplicate_ticket_id])
 
 
 def ensure_database_directory() -> None:
@@ -538,6 +499,8 @@ def _conversation_for_record(record: TicketRecord) -> list[ChatMessage]:
 
 
 def _ticket_to_read(record: TicketRecord) -> TicketRead:
+    # Resolution insights are derived at read-time via the insights pipeline.
+    # Ignore stored dynamic links to avoid serving stale duplicate/KB data.
     return TicketRead(
         id=record.id,
         user_id=record.user_id,
@@ -549,7 +512,7 @@ def _ticket_to_read(record: TicketRecord) -> TicketRead:
         project_id=record.project_id,
         tag_slugs=_tag_slugs_for_record(record),
         intelligence=TicketIntelligence.model_validate(record.intelligence),
-        resolution=ResolutionData.model_validate(record.resolution or {}),
+        resolution=ResolutionData(),
         conversation=_conversation_for_record(record),
         guardrail=GuardrailDecision.model_validate(record.guardrail) if record.guardrail else None,
         raw_context=record.raw_context or {},
@@ -586,7 +549,7 @@ def create_tickets(
 
 def _add_ticket_record(db: Session, ticket: TicketCreate) -> TicketRecord:
     intelligence = ticket.intelligence.model_dump(mode="json")
-    resolution = ticket.resolution.model_dump(mode="json")
+    resolution = ResolutionData().model_dump(mode="json")
     timestamp_fields: dict[str, datetime] = {}
     if ticket.created_at:
         timestamp_fields["created_at"] = ticket.created_at
@@ -625,27 +588,6 @@ def _add_ticket_record(db: Session, ticket: TicketCreate) -> TicketRecord:
                 role=message.role.value,
                 content=message.content,
                 created_at=message.created_at,
-            )
-        )
-
-    for article in ticket.resolution.linked_kb_articles:
-        db.add(
-            TicketKBLinkRecord(
-                ticket_id=record.id,
-                kb_id=article.kb_id,
-                title=article.title,
-                source=article.source,
-                relevance_score=article.relevance_score,
-                clearance=article.clearance.value,
-            )
-        )
-
-    for duplicate_id in ticket.resolution.duplicate_ticket_ids:
-        db.add(
-            RelatedTicketLinkRecord(
-                ticket_id=record.id,
-                duplicate_ticket_id=duplicate_id,
-                score=1.0,
             )
         )
 
@@ -805,63 +747,47 @@ def search_tickets(
     return merged[:limit]
 
 
-def find_duplicate_candidates(
-    db: Session,
-    keywords: list[str],
+def find_recent_similar_tickets(
+    query: str,
+    *,
     exclude_ticket_id: int | None = None,
-    limit: int = 5,
+    project_id: int | None = None,
+    limit: int = 10,
+    candidate_limit: int = 40,
 ) -> list[dict[str, Any]]:
-    if not keywords:
+    """Return vector-similar tickets ordered by most recent created_at."""
+    if not query or not query.strip():
         return []
 
     try:
-        vector_results = _search_ticket_vectors(
-            " ".join(keywords),
+        candidates = _search_ticket_vectors(
+            query,
+            project_id=project_id,
             exclude_ticket_id=exclude_ticket_id,
-            limit=limit,
+            limit=max(limit, candidate_limit),
         )
     except TicketVectorUnavailableError:
-        logger.warning("Skipping duplicate vector search because the ticket vector store failed")
-        vector_results = []
+        logger.warning("Skipping recent similar ticket search because vector search failed")
+        return []
 
-    wanted = {keyword.casefold() for keyword in keywords}
-    duplicate_conditions = _ticket_match_conditions(list(wanted))
-    stmt = (
-        select(TicketRecord)
-        .where(or_(*duplicate_conditions))
-        .order_by(TicketRecord.created_at.desc())
-        .limit(max(limit * 10, 50))
-    )
-    if exclude_ticket_id is not None:
-        stmt = stmt.where(TicketRecord.id != exclude_ticket_id)
+    results: list[dict[str, Any]] = []
+    for candidate in candidates:
+        created_at = str(candidate.get("created_at") or "")
+        results.append(
+            {
+                "ticket_id": candidate.get("ticket_id"),
+                "summary": candidate.get("summary"),
+                "status": candidate.get("status"),
+                "priority": candidate.get("priority"),
+                "category": candidate.get("category"),
+                "score": candidate.get("score", 0.0),
+                "created_at": created_at,
+            }
+        )
 
-    matches: list[dict[str, Any]] = []
-    for record in db.scalars(stmt).all():
-        existing = {keyword.casefold() for keyword in (record.keywords or [])}
-        if not existing:
-            continue
-        score = len(wanted & existing) / max(len(wanted | existing), 1)
-        if score > 0:
-            matches.append({"ticket_id": record.id, "summary": record.summary, "score": score})
-
-    matches.sort(key=lambda item: item["score"], reverse=True)
-    vector_matches = [
-        {
-            "ticket_id": result["ticket_id"],
-            "summary": result["summary"],
-            "score": result["score"],
-        }
-        for result in vector_results
-    ]
-    if not vector_matches:
-        return matches[:limit]
-
-    seen = {result["ticket_id"] for result in vector_matches}
-    merged = [
-        *vector_matches,
-        *(result for result in matches if result["ticket_id"] not in seen),
-    ]
-    return merged[:limit]
+    # ISO-8601 timestamps sort lexicographically in chronological order.
+    results.sort(key=lambda item: (item.get("created_at") or "", item.get("score") or 0.0), reverse=True)
+    return results[:limit]
 
 
 def _like_pattern(value: str) -> str:
@@ -953,19 +879,6 @@ def _search_ticket_vectors(
         raise TicketVectorUnavailableError("Ticket vector search failed") from exc
 
     return [ticket_vector_result_to_api(result) for result in results]
-
-
-def kb_refs_from_records(records: list[TicketKBLinkRecord]) -> list[KBArticleRef]:
-    return [
-        KBArticleRef(
-            kb_id=record.kb_id,
-            title=record.title,
-            source=record.source,
-            relevance_score=record.relevance_score,
-            clearance=UserClearance(record.clearance),
-        )
-        for record in records
-    ]
 
 
 # ── User helpers ───────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import { Button, FieldError, IconButton } from "./common";
 interface NewTicketModalProps {
   open: boolean;
   user: ApiUser | null;
+  projectId: number | null;
   onClose: () => void;
   onCreated: (ticket: Ticket) => void;
 }
@@ -16,7 +17,7 @@ const environments: Environment[] = ["unknown", "development", "staging", "produ
 const priorities = ["Low", "Medium", "High", "Critical"] as const;
 type PriorityLabel = (typeof priorities)[number];
 
-export function NewTicketModal({ open, user, onClose, onCreated }: NewTicketModalProps) {
+export function NewTicketModal({ open, user, projectId, onClose, onCreated }: NewTicketModalProps) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<TicketCategory>("Infra");
@@ -45,6 +46,7 @@ export function NewTicketModal({ open, user, onClose, onCreated }: NewTicketModa
         app_name: appName.trim() || null,
         environment,
         clearance: user?.clearance ?? "public",
+        project_id: projectId,
         category,
         priority,
         keywords: keywords
