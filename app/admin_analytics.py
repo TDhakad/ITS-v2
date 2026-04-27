@@ -168,6 +168,7 @@ Use tools before answering factual analytics questions.
 Tool guidance:
 - Use count_tickets for exact ticket counts.
 - Use group_tickets for breakdowns by status, priority, category, user, app, environment, or project.
+- Use list_tickets to fetch matching ticket rows after an exact count or when the admin asks to show tickets.
 - Use ticket_trend for time-series counts.
 - Use semantic_ticket_search for themes, similar incidents, recurring complaints, and fuzzy natural-language topics.
 - Use run_read_only_sql only when the structured tools cannot express the question.
@@ -176,6 +177,7 @@ Rules:
 - SQL/database tool results are the source of truth for counts, comparisons, and trends.
 - Vector search is approximate. Never use vector results to produce exact counts.
 - For mixed questions, use SQL for the number and vector search for qualitative examples/themes.
+- For dashboard-style related/contains searches, use text_query with count_tickets/list_tickets.
 - Today's date is {today}. Prefer date_range values when they match the user's request.
 - Be concise and explain any limitation, such as missing assignee/resolver fields.
 
@@ -184,6 +186,7 @@ Available ticket fields:
 - priority: stored as tickets.suggested_priority; values Low, Medium, High, Critical
 - category: Bug, Feature, UI, Infra, Hardware
 - created_at, updated_at, user_id, app_name, environment, project_id, summary
+- text_query: case-insensitive contains search across summary, app, category, environment, and keywords
 """
 
 
@@ -232,6 +235,14 @@ class TicketFilterArgs(BaseModel):
     app_name: str | None = None
     environment: str | None = None
     project_id: int | None = None
+    text_query: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Case-insensitive contains search across ticket summary, app_name, "
+            "category, environment, and keywords. Use for dashboard-style related searches."
+        ),
+    )
 
     @field_validator("date_range", mode="before")
     @classmethod
@@ -252,6 +263,10 @@ class TicketFilterArgs(BaseModel):
 class GroupTicketsArgs(TicketFilterArgs):
     group_by: GroupByName = Field(description="Dimension to group ticket counts by.")
     limit: int = Field(default=10, ge=1, le=25)
+
+
+class ListTicketsArgs(TicketFilterArgs):
+    limit: int = Field(default=10, ge=1, le=50)
 
 
 class TicketTrendArgs(TicketFilterArgs):
@@ -355,6 +370,7 @@ def count_tickets(
     app_name: str | None = None,
     environment: str | None = None,
     project_id: int | None = None,
+    text_query: str | None = None,
 ) -> str:
     """Count tickets with exact SQL filters."""
 
@@ -369,6 +385,7 @@ def count_tickets(
         app_name=app_name,
         environment=environment,
         project_id=project_id,
+        text_query=text_query,
     )
     where_sql, params = _ticket_where_clause(filters)
     rows = _run_sql(f"select count(*) from tickets{where_sql}", params, purpose="count_tickets")
@@ -389,6 +406,7 @@ def group_tickets(
     app_name: str | None = None,
     environment: str | None = None,
     project_id: int | None = None,
+    text_query: str | None = None,
     limit: int = 10,
 ) -> str:
     """Group ticket counts by a supported dimension."""
@@ -405,6 +423,7 @@ def group_tickets(
         app_name=app_name,
         environment=environment,
         project_id=project_id,
+        text_query=text_query,
     )
     where_sql, params = _ticket_where_clause(filters)
     params["limit"] = limit
@@ -422,6 +441,73 @@ def group_tickets(
     )
 
 
+def list_tickets(
+    date_range: DateRangeName | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    category: str | None = None,
+    user_id: str | None = None,
+    app_name: str | None = None,
+    environment: str | None = None,
+    project_id: int | None = None,
+    text_query: str | None = None,
+    limit: int = 10,
+) -> str:
+    """Return matching ticket rows with the same filters used for counts."""
+
+    filters = _ticket_filters(
+        date_range=date_range,
+        created_from=created_from,
+        created_to=created_to,
+        status=status,
+        priority=priority,
+        category=category,
+        user_id=user_id,
+        app_name=app_name,
+        environment=environment,
+        project_id=project_id,
+        text_query=text_query,
+    )
+    where_sql, params = _ticket_where_clause(filters)
+    count_rows = _rows_from_sql_result(
+        _run_sql(f"select count(*) from tickets{where_sql}", params, purpose="list_tickets_count")
+    )
+    total_count = count_rows[0][0] if count_rows else 0
+    list_params = dict(params)
+    list_params["limit"] = limit
+    sql = (
+        "select id, summary, status, suggested_priority, category, app_name, environment, "
+        f"user_id, created_at, updated_at from tickets{where_sql} "
+        "order by created_at desc limit :limit"
+    )
+    rows = _rows_from_sql_result(_run_sql(sql, list_params, purpose="list_tickets"))
+    return _json(
+        {
+            "filters": filters,
+            "total_count": total_count,
+            "result_count": len(rows),
+            "limit": limit,
+            "rows": [
+                {
+                    "ticket_id": row[0],
+                    "summary": row[1],
+                    "status": row[2],
+                    "priority": row[3],
+                    "category": row[4],
+                    "app_name": row[5],
+                    "environment": row[6],
+                    "user_id": row[7],
+                    "created_at": row[8],
+                    "updated_at": row[9],
+                }
+                for row in rows
+            ],
+        }
+    )
+
+
 def ticket_trend(
     interval: TrendInterval = "day",
     date_range: DateRangeName | None = None,
@@ -434,6 +520,7 @@ def ticket_trend(
     app_name: str | None = None,
     environment: str | None = None,
     project_id: int | None = None,
+    text_query: str | None = None,
     limit: int = 30,
 ) -> str:
     """Return ticket count trend buckets by day, week, or month."""
@@ -454,6 +541,7 @@ def ticket_trend(
         app_name=app_name,
         environment=environment,
         project_id=project_id,
+        text_query=text_query,
     )
     where_sql, params = _ticket_where_clause(filters)
     params["limit"] = limit
@@ -544,6 +632,7 @@ def describe_analytics_schema() -> str:
                 "category": [category.value for category in TicketCategory],
                 "dates": ["created_at", "updated_at"],
                 "dimensions": list(GROUP_BY_COLUMNS),
+                "text_query": "Case-insensitive contains search across summary, app, category, environment, and keywords.",
                 "semantic_search": "Use semantic_ticket_search for themes and similar tickets.",
             },
         }
@@ -571,6 +660,12 @@ def _get_admin_tools() -> list[BaseTool]:
             name="group_tickets",
             description="Group exact ticket counts by one dimension.",
             args_schema=GroupTicketsArgs,
+        ),
+        StructuredTool.from_function(
+            list_tickets,
+            name="list_tickets",
+            description="Return matching ticket rows for exact filters with a bounded limit.",
+            args_schema=ListTicketsArgs,
         ),
         StructuredTool.from_function(
             ticket_trend,
@@ -797,6 +892,7 @@ def _ticket_filters(
     app_name: str | None = None,
     environment: str | None = None,
     project_id: int | None = None,
+    text_query: str | None = None,
 ) -> dict[str, Any]:
     filters: dict[str, Any] = {}
     if date_range:
@@ -824,6 +920,8 @@ def _ticket_filters(
         filters["environment"] = environment
     if project_id is not None:
         filters["project_id"] = project_id
+    if text_query and text_query.strip():
+        filters["text_query"] = text_query.strip()
     return filters
 
 
@@ -837,7 +935,7 @@ def _ticket_where_clause(filters: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         "priority": ("suggested_priority = :priority", "priority"),
         "category": ("category = :category", "category"),
         "user_id": ("user_id = :user_id", "user_id"),
-        "app_name": ("app_name = :app_name", "app_name"),
+        "app_name": ("lower(app_name) = lower(:app_name)", "app_name"),
         "environment": ("environment = :environment", "environment"),
         "project_id": ("project_id = :project_id", "project_id"),
     }
@@ -846,6 +944,15 @@ def _ticket_where_clause(filters: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             continue
         clauses.append(clause)
         params[param_name] = filters[key]
+    if "text_query" in filters:
+        clauses.append(
+            "("
+            "lower(coalesce(summary, '') || ' ' || coalesce(app_name, '') || ' ' || "
+            "coalesce(category, '') || ' ' || coalesce(environment, '') || ' ' || "
+            "coalesce(cast(keywords as text), '')) like :text_query escape '\\'"
+            ")"
+        )
+        params["text_query"] = _contains_pattern(str(filters["text_query"]).casefold())
 
     if not clauses:
         return "", params
@@ -1060,6 +1167,8 @@ def _requires_grounding(question: str) -> bool:
             "top",
             "most",
             "least",
+            "show",
+            "list",
             "created",
             "resolved",
             "closed",
@@ -1117,7 +1226,9 @@ def _answer_from_trace(question: str, trace: dict[str, Any]) -> str:
 
 def _direct_answer_from_trace(trace: dict[str, Any]) -> str:
     has_exact_data = any(
-        tool.get("ok") and tool.get("name") in {"run_read_only_sql", "count_tickets", "group_tickets", "ticket_trend"}
+        tool.get("ok")
+        and tool.get("name")
+        in {"run_read_only_sql", "count_tickets", "group_tickets", "list_tickets", "ticket_trend"}
         for tool in trace.get("tools", [])
     )
     for tool in reversed(trace.get("tools", [])):
@@ -1137,6 +1248,15 @@ def _direct_answer_from_trace(trace: dict[str, Any]) -> str:
                 group_by = payload.get("group_by", "field")
                 parts = ", ".join(f"{row['bucket']}: {row['count']}" for row in rows)
                 return f"Ticket count by {group_by}: {parts}."
+        if name == "list_tickets":
+            rows = payload.get("rows") or []
+            total_count = payload.get("total_count", len(rows))
+            if rows:
+                parts = ", ".join(
+                    f"#{row['ticket_id']} {row['summary']}" for row in rows[:10]
+                )
+                return f"There were {total_count} matching tickets. Showing {len(rows)}: {parts}."
+            return "There were 0 matching tickets."
         if name == "ticket_trend":
             rows = payload.get("rows") or []
             if rows:
@@ -1150,6 +1270,11 @@ def _direct_answer_from_trace(trace: dict[str, Any]) -> str:
 
 def _elapsed_ms(started: float) -> int:
     return int((perf_counter() - started) * 1000)
+
+
+def _contains_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 @lru_cache(maxsize=1)

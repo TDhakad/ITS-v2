@@ -186,6 +186,25 @@ def search_existing_tickets(query: str) -> str:
 
 
 @tool
+def analyze_ticket_data(question: str) -> str:
+    """Answer exact ticket analytics questions with read-only SQL-backed tools.
+
+    Use this for ticket counts, totals, breakdowns, trends, and bounded lists
+    (for example: "how many VPN tickets?", "break VPN tickets down by status",
+    or "show the matching VPN tickets"). Do not infer exact totals from
+    search_existing_tickets or vector_search_tickets.
+    """
+    try:
+        from app.admin_analytics import run_admin_analytics_question
+
+        result = run_admin_analytics_question(question)
+        return str(result.get("answer") or "No analytics answer was generated.")
+    except Exception:
+        logger.exception("Ticket analytics failed")
+        return "Ticket analytics unavailable."
+
+
+@tool
 def vector_search_tickets(
     query: str,
     status: str | None = None,
@@ -312,6 +331,7 @@ def create_helpdesk_ticket(
 
 _TOOLS: list[BaseTool] = [
     search_knowledge_base,
+    analyze_ticket_data,
     search_existing_tickets,
     vector_search_tickets,
     create_helpdesk_ticket,
@@ -327,6 +347,9 @@ How to handle requests:
 - To resolve issues: Always search the Knowledge Base (search_knowledge_base)
   AND historical tickets for potential solutions.
     - Prioritize official KB articles: Provide clear, actionable steps from the KB first.
+    - Use analyze_ticket_data for exact ticket counts, totals, aggregations,
+      breakdowns, trends, or when the user asks to list/show matching tickets.
+      Counts must come from this SQL-backed analytics tool, not from search result limits.
     - Use vector_search_tickets when a user describes symptoms, impact, errors,
       or an issue in natural language and you need semantically similar tickets.
     - Use search_existing_tickets when the user asks for exact ticket status,
