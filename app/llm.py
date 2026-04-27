@@ -26,8 +26,6 @@ def get_chat_model(settings: Settings | None = None) -> BaseChatModel:
         )
 
     if provider == "ollama":
-        import os
-        print("in here", settings.ollama_model)
         return ChatOllama(
             model=settings.ollama_model,
             base_url=settings.ollama_base_url,
@@ -48,9 +46,14 @@ def get_embedding_model(settings: Settings | None = None) -> Embeddings:
     if provider == "openai":
         if not settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai.")
+        kwargs = {
+            "model": settings.openai_embedding_model,
+            "api_key": settings.openai_api_key,
+        }
+        if settings.openai_embedding_dimensions is not None:
+            kwargs["dimensions"] = settings.openai_embedding_dimensions
         return OpenAIEmbeddings(
-            model=settings.openai_embedding_model,
-            api_key=settings.openai_api_key,
+            **kwargs,
         )
 
     if provider in {"huggingface", "hf"}:

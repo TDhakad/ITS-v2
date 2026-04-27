@@ -436,6 +436,7 @@ button:disabled {
 }
 
 .chat-composer textarea,
+.analytics-form textarea,
 .filter-bar input,
 .filter-bar select {
   width: 100%;
@@ -450,6 +451,112 @@ button:disabled {
 .chat-composer textarea {
   min-height: 72px;
   resize: vertical;
+}
+
+.analytics-form {
+  display: grid;
+  gap: 10px;
+}
+
+.analytics-form label {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.analytics-form textarea {
+  min-height: 104px;
+  resize: vertical;
+}
+
+.analytics-form .button {
+  width: fit-content;
+}
+
+.analytics-answer {
+  min-height: 72px;
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fbfcfd;
+  padding: 12px;
+}
+
+.analytics-answer p {
+  margin: 0;
+}
+
+.analytics-trace {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.analytics-trace summary {
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.analytics-trace pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 10px 0 0;
+  border-radius: 8px;
+  background: #111827;
+  color: #e5e7eb;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+
+.analytics-error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.analytics-console {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px 20px 18px;
+}
+
+.analytics-heading {
+  margin-bottom: 12px;
+}
+
+.analytics-heading h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.25;
+}
+
+.analytics-console-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.72fr) minmax(320px, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.analytics-console .analytics-form {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px 12px;
+}
+
+.analytics-console .analytics-form label {
+  grid-column: 1 / -1;
+}
+
+.analytics-console .analytics-form textarea {
+  min-height: 88px;
+}
+
+.analytics-console .analytics-answer {
+  min-height: 88px;
+  margin-top: 0;
 }
 
 .context-panel {
@@ -783,6 +890,15 @@ dd {
     grid-template-columns: 1fr;
   }
 
+  .analytics-console-grid,
+  .analytics-console .analytics-form {
+    grid-template-columns: 1fr;
+  }
+
+  .analytics-console .analytics-form .button {
+    width: 100%;
+  }
+
   .detail-grid {
     grid-template-columns: 1fr;
   }
@@ -794,6 +910,7 @@ dd {
   .message-list,
   .chat-composer,
   .context-panel,
+  .analytics-console,
   .dashboard-toolbar,
   .panel-heading,
   .detail-block,

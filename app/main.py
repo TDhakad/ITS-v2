@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any
+import logging
+from pathlib import Path
+from typing import Annotated, Any
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.auth import (
@@ -23,16 +26,26 @@ from app.auth import (
 )
 from app.db import (
     add_project_member,
+    add_chat_turn_messages,
     create_project,
-    create_ticket as persist_ticket,
     find_duplicate_candidates,
+    get_project_by_id,
     get_session,
     get_ticket,
+    get_user_by_id,
+    get_user_project_ids,
     init_db,
+    list_chat_messages,
+    list_chat_threads,
+    list_project_members,
     list_projects,
     list_tags,
     list_tickets,
-    seed_default_tags,
+    list_users,
+    remove_project_member,
+)
+from app.db import (
+    create_ticket as persist_ticket,
 )
 from app.schemas import (
     Environment,
@@ -52,6 +65,11 @@ from app.schemas import (
 )
 from app.settings import get_settings
 
+AdminRole = require_role(UserRole.ADMIN)
+AdminUser = Annotated[UserRead, Depends(AdminRole)]
+CurrentUser = Annotated[UserRead, Depends(get_current_user)]
+OptionalUser = Annotated[UserRead | None, Depends(get_optional_user)]
+DBSession = Annotated[Session, Depends(get_session)]
 
 app = FastAPI(
     title="Capstone ITS v2",
@@ -62,7 +80,13 @@ app = FastAPI(
 )
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+FRONTEND_INDEX = FRONTEND_DIST / "index.html"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+if FRONTEND_ASSETS.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
 _db_initialized = False
+logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
@@ -104,6 +128,10 @@ class AdminResetPasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class AdminAnalyticsRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1_000)
+
+
 class TicketCreateRequest(BaseModel):
     description: str = Field(min_length=1, max_length=8000)
     user_id: str = Field(default="anonymous", min_length=1, max_length=120)
@@ -128,14 +156,14 @@ def startup() -> None:
 
 @app.get("/openapi.json", include_in_schema=False)
 def openapi_schema(
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    _: AdminUser,
 ) -> JSONResponse:
     return JSONResponse(app.openapi())
 
 
 @app.get("/docs", include_in_schema=False, response_class=HTMLResponse)
 def swagger_ui(
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    _: AdminUser,
 ) -> HTMLResponse:
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
@@ -147,25 +175,45 @@ def swagger_ui(
 # ── Pages ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-def chat_page(request: Request) -> HTMLResponse:
+def chat_page(request: Request) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "chat.html")
 
 
 @app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request) -> HTMLResponse:
+def login_page(request: Request) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "login.html")
 
 
 @app.get("/register", response_class=HTMLResponse)
-def register_page(request: Request) -> HTMLResponse:
+def register_page(request: Request) -> Response:
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "register.html")
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(
     request: Request,
-    current_user: UserRead = Depends(require_role(UserRole.ADMIN)),
-) -> HTMLResponse:
+    current_user: OptionalUser,
+) -> Response:
+    # Auth checks MUST happen before serving the SPA so /admin stays protected.
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to perform this action.",
+        )
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "admin.html")
 
 
@@ -174,12 +222,52 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/chat/threads")
+def chat_threads(
+    db: DBSession,
+    current_user: OptionalUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    resolved_user_id = str(current_user.id) if current_user else "anonymous"
+    threads = list_chat_threads(db, user_id=resolved_user_id)
+    return {"threads": threads}
+
+
+@app.get("/api/chat/history")
+def chat_history(
+    db: DBSession,
+    current_user: OptionalUser,
+    thread_id: str | None = Query(default=None, max_length=120),
+) -> dict[str, Any]:
+    _ensure_db()
+    resolved_user_id = str(current_user.id) if current_user else "anonymous"
+    resolved_thread_id = _resolve_chat_thread_id(resolved_user_id, thread_id)
+    try:
+        records = list_chat_messages(
+            db,
+            user_id=resolved_user_id,
+            thread_id=resolved_thread_id,
+        )
+    except SQLAlchemyError as exc:
+        logger.exception("Chat history unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat history unavailable.",
+        ) from exc
+
+    return {
+        "conversation_id": resolved_thread_id,
+        "thread_id": resolved_thread_id,
+        "messages": [_chat_message_to_api(record) for record in records],
+    }
+
+
 @app.post("/api/chat")
 def chat_turn(
     payload: ChatRequest,
     request: Request,
-    db: Session = Depends(get_session),
-    current_user: UserRead | None = Depends(get_optional_user),
+    db: DBSession,
+    current_user: OptionalUser,
 ) -> dict[str, Any]:
     _ensure_db()
     settings = get_settings()
@@ -190,7 +278,22 @@ def chat_turn(
     else:
         resolved_user_id = payload.user_id
         resolved_clearance = payload.clearance or UserClearance(settings.standard_user_clearance)
-    thread_id = payload.thread_id or payload.conversation_id or f"{resolved_user_id}-default"
+    thread_id = _resolve_chat_thread_id(
+        resolved_user_id,
+        payload.thread_id or payload.conversation_id,
+    )
+    # Resolve project: auto-detect from the user's memberships for non-admin users
+    # so the agent is always scoped to the correct project.
+    resolved_project_id = payload.project_id
+    resolved_project_ids: list[int] | None = None
+    if current_user and current_user.role != UserRole.ADMIN:
+        user_project_ids = get_user_project_ids(db, current_user.id)
+        if user_project_ids:
+            resolved_project_ids = user_project_ids
+            if payload.project_id and payload.project_id in user_project_ids:
+                resolved_project_id = payload.project_id
+            else:
+                resolved_project_id = user_project_ids[0]
     try:
         graph = importlib.import_module("app.graph")
         runner = (
@@ -213,15 +316,17 @@ def chat_turn(
                 app_name=payload.app_name,
                 environment=payload.environment,
                 clearance=resolved_clearance,
-                project_id=payload.project_id,
+                project_id=resolved_project_id,
+                project_ids=resolved_project_ids,
+                display_name=current_user.display_name if current_user else "User",
+                user_role=current_user.role.value if current_user else "user",
             )
     except Exception as exc:
-        detail = (
-            "Chat backend unavailable. Confirm OPENAI_API_KEY, vector store/RAG dependencies, "
-            f"and app.graph initialization. Original error: {exc}"
-        )
-        print(detail)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail) from exc
+        logger.exception("Chat backend unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat backend unavailable. Check server logs for initialization details.",
+        ) from exc
 
     ticket_id = _result_value(result, "ticket_id")
     ticket = _safe_get_ticket(db, ticket_id) if ticket_id else None
@@ -245,13 +350,24 @@ def chat_turn(
     }
     if ticket:
         response["ticket"] = ticket_to_api(ticket)
+    try:
+        add_chat_turn_messages(
+            db,
+            user_id=resolved_user_id,
+            thread_id=thread_id,
+            user_message=payload.message,
+            assistant_message=response_text,
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Could not persist chat history for thread %s", thread_id)
     return response
 
 
 @app.post("/api/tickets", status_code=status.HTTP_201_CREATED)
 def create_ticket(
     payload: TicketCreateRequest,
-    db: Session = Depends(get_session),
+    db: DBSession,
 ) -> dict[str, Any]:
     _ensure_db()
     try:
@@ -280,49 +396,74 @@ def create_ticket(
         return {"ticket": ticket_to_api(ticket, include_conversation=True)}
     except Exception as exc:
         db.rollback()
-        detail = f"Ticket persistence unavailable or not initialized. Original error: {exc}"
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail) from exc
+        logger.exception("Ticket persistence failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket persistence unavailable.",
+        ) from exc
 
 
 @app.get("/api/tickets")
 def tickets(
+    db: DBSession,
+    current_user: OptionalUser,
     status_filter: str | None = Query(default=None, alias="status"),
     user_id: str | None = None,
     project_id: int | None = Query(default=None),
     tag_slug: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    db: Session = Depends(get_session),
 ) -> dict[str, list[dict[str, Any]]]:
     _ensure_db()
     parsed_status = _parse_status(status_filter)
+
+    # Scope non-admin users to their project memberships so they never see
+    # tickets that belong to other projects.
+    effective_project_id: int | None = project_id
+    effective_project_ids: list[int] | None = None
+    if current_user and current_user.role != UserRole.ADMIN:
+        user_project_ids = get_user_project_ids(db, current_user.id)
+        if user_project_ids:
+            if project_id and project_id in user_project_ids:
+                effective_project_id = project_id  # honour the requested project
+            elif len(user_project_ids) == 1:
+                effective_project_id = user_project_ids[0]
+            else:
+                effective_project_ids = user_project_ids
+                effective_project_id = None
+        else:
+            # No project memberships — fall back to the user's own tickets only.
+            user_id = str(current_user.id)
+
     try:
-        found = list_tickets(db, parsed_status, project_id=project_id,
-                             tag_slug=tag_slug, limit=limit)
-        payload = [ticket_to_api(ticket) for ticket in found]
-    except Exception:
-        payload = [
-            _record_to_api(record)
-            for record in _list_ticket_records(db, parsed_status, limit)
-        ]
-    if user_id is not None:
-        payload = [ticket for ticket in payload if ticket.get("user_id") == user_id]
-    return {"tickets": payload}
+        found = list_tickets(
+            db,
+            parsed_status,
+            project_id=effective_project_id,
+            project_ids=effective_project_ids,
+            tag_slug=tag_slug,
+            user_id=user_id,
+            limit=limit,
+        )
+    except SQLAlchemyError as exc:
+        logger.exception("Ticket listing failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket listing unavailable.",
+        ) from exc
+    return {"tickets": [ticket_to_api(ticket) for ticket in found]}
 
 
 @app.get("/api/tickets/{ticket_id}")
-def ticket_detail(ticket_id: int, db: Session = Depends(get_session)) -> dict[str, Any]:
+def ticket_detail(ticket_id: int, db: DBSession) -> dict[str, Any]:
     _ensure_db()
     ticket = _safe_get_ticket(db, ticket_id)
     if not ticket:
-        record = _get_ticket_record(db, ticket_id)
-        if record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
-        return _record_to_api(record, include_conversation=True)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found")
     return ticket_to_api(ticket, include_conversation=True)
 
 
 @app.get("/api/tickets/{ticket_id}/insights")
-def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[str, Any]:
+def ticket_insights(ticket_id: int, db: DBSession) -> dict[str, Any]:
     _ensure_db()
     ticket = _safe_get_ticket(db, ticket_id)
     if not ticket:
@@ -336,11 +477,12 @@ def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[
     )
     kb_refs = list(ticket.resolution.linked_kb_articles)
     suggested_fixes = list(ticket.resolution.suggested_fixes)
+    retrieval_available = True
 
     try:
         rag_module = importlib.import_module("app.rag")
-        rag_class = getattr(rag_module, "HybridRAGPipeline")
-        context_factory = getattr(rag_module, "context_from_user")
+        rag_class = rag_module.HybridRAGPipeline
+        context_factory = rag_module.context_from_user
         rag = rag_class()
         context = context_factory(
             category=ticket.intelligence.category,
@@ -351,6 +493,8 @@ def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[
         docs = rag.retrieve(ticket.intelligence.summary, context, k=5)
         kb_refs = rag.article_refs(docs) or kb_refs
     except Exception:
+        logger.exception("Ticket insight knowledge retrieval failed")
+        retrieval_available = False
         docs = []
 
     if not suggested_fixes:
@@ -374,16 +518,17 @@ def ticket_insights(ticket_id: int, db: Session = Depends(get_session)) -> dict[
         "duplicates": duplicates,
         "suggested_fixes": suggested_fixes,
         "retrieved_chunks": len(docs),
+        "retrieval_available": retrieval_available,
     }
 
 
 @app.get("/api/admin/insights")
 def admin_insights(
-    db: Session = Depends(get_session),
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    db: DBSession,
+    _: AdminUser,
 ) -> dict[str, Any]:
     _ensure_db()
-    graph_error: str | None = None
+    graph_available = True
     try:
         graph = importlib.import_module("app.graph")
         insights_func = getattr(graph, "admin_insights", None) or getattr(
@@ -393,13 +538,18 @@ def admin_insights(
         )
         if callable(insights_func):
             return {"available": True, "source": "app.graph", "data": insights_func()}
-    except Exception as exc:
-        graph_error = str(exc)
+    except Exception:
+        graph_available = False
+        logger.exception("Graph admin insights unavailable; using database aggregate")
 
     try:
         ticket_payload = [ticket_to_api(ticket) for ticket in list_tickets(db, None, limit=500)]
-    except Exception:
-        ticket_payload = [_record_to_api(record) for record in _list_ticket_records(db, None, 500)]
+    except SQLAlchemyError as exc:
+        logger.exception("Admin insight ticket aggregate failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin insights unavailable.",
+        ) from exc
 
     by_status = _count_by(ticket_payload, "status")
     by_priority = _count_by(ticket_payload, "priority")
@@ -407,7 +557,7 @@ def admin_insights(
     return {
         "available": True,
         "source": "app.db",
-        "graph_error": graph_error,
+        "graph_available": graph_available,
         "data": {
             "total_tickets": len(ticket_payload),
             "by_status": by_status,
@@ -417,12 +567,31 @@ def admin_insights(
     }
 
 
+@app.post("/api/admin/analytics")
+def admin_analytics(
+    payload: AdminAnalyticsRequest,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    try:
+        from app.admin_analytics import run_admin_analytics_question
+
+        result = run_admin_analytics_question(payload.question)
+    except Exception as exc:
+        logger.exception("Admin analytics failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin analytics unavailable.",
+        ) from exc
+    return {"question": payload.question, **result}
+
+
 # ── Auth routes ──────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def auth_register(
     payload: RegisterRequest,
-    db: Session = Depends(get_session),
+    db: DBSession,
 ) -> UserRead:
     _ensure_db()
     return register(db, payload.email, payload.display_name, payload.password)
@@ -433,7 +602,7 @@ def auth_login(
     payload: LoginRequest,
     request: Request,
     response: Response,
-    db: Session = Depends(get_session),
+    db: DBSession,
 ) -> UserRead:
     _ensure_db()
     user_agent = request.headers.get("user-agent", "")
@@ -453,7 +622,7 @@ def auth_login(
 
 @app.post("/auth/logout")
 def auth_logout(
-    db: Session = Depends(get_session),
+    db: DBSession,
     session_token: str | None = Cookie(default=None),
 ) -> RedirectResponse:
     if session_token:
@@ -470,15 +639,15 @@ def auth_login_redirect() -> RedirectResponse:
 
 
 @app.get("/auth/me")
-def auth_me(current_user: UserRead = Depends(get_current_user)) -> UserRead:
+def auth_me(current_user: CurrentUser) -> UserRead:
     return current_user
 
 
 @app.post("/auth/change-password", status_code=status.HTTP_204_NO_CONTENT)
 def auth_change_password(
     payload: ChangePasswordRequest,
-    db: Session = Depends(get_session),
-    current_user: UserRead = Depends(get_current_user),
+    db: DBSession,
+    current_user: CurrentUser,
 ) -> None:
     change_password(db, current_user.id, payload.current_password, payload.new_password)
 
@@ -486,8 +655,8 @@ def auth_change_password(
 @app.post("/auth/reset-password", status_code=status.HTTP_204_NO_CONTENT)
 def auth_reset_password(
     payload: AdminResetPasswordRequest,
-    db: Session = Depends(get_session),
-    _: UserRead = Depends(require_role(UserRole.ADMIN)),
+    db: DBSession,
+    _: AdminUser,
 ) -> None:
     admin_reset_password(db, payload.email, payload.new_password)
 
@@ -496,8 +665,8 @@ def auth_reset_password(
 
 @app.get("/api/projects")
 def get_projects(
-    db: Session = Depends(get_session),
-    _: UserRead = Depends(get_current_user),
+    db: DBSession,
+    _: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
     records = list_projects(db)
@@ -511,8 +680,8 @@ def get_projects(
 @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
 def post_project(
     payload: ProjectCreateRequest,
-    db: Session = Depends(get_session),
-    current_user: UserRead = Depends(get_current_user),
+    db: DBSession,
+    current_user: CurrentUser,
 ) -> dict[str, Any]:
     _ensure_db()
     record = create_project(db, ProjectCreate(
@@ -525,14 +694,116 @@ def post_project(
     return {"id": record.id, "name": record.name, "slug": record.slug}
 
 
+class AddMemberRequest(BaseModel):
+    user_id: int
+    access_level: ProjectAccessLevel = ProjectAccessLevel.MEMBER
+
+
+@app.get("/api/projects/{project_id}/members")
+def get_project_members(
+    project_id: int,
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    project = get_project_by_id(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+    members = list_project_members(db, project_id)
+    return {
+        "project_id": project_id,
+        "members": [
+            {
+                "user_id": m.user_id,
+                "access_level": m.access_level,
+                "display_name": m.user.display_name if m.user else None,
+                "email": m.user.email if m.user else None,
+            }
+            for m in members
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/members", status_code=status.HTTP_201_CREATED)
+def post_project_member(
+    project_id: int,
+    payload: AddMemberRequest,
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    project = get_project_by_id(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+    target_user = get_user_by_id(db, payload.user_id)
+    if target_user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+    member = add_project_member(db, project_id, payload.user_id, payload.access_level.value)
+    return {
+        "project_id": project_id,
+        "user_id": member.user_id,
+        "access_level": member.access_level,
+    }
+
+
+@app.delete("/api/projects/{project_id}/members/{user_id}",
+            status_code=status.HTTP_204_NO_CONTENT)
+def delete_project_member(
+    project_id: int,
+    user_id: int,
+    db: DBSession,
+    _: AdminUser,
+) -> None:
+    _ensure_db()
+    removed = remove_project_member(db, project_id, user_id)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Membership not found.",
+        )
+
+
+@app.get("/api/users")
+def get_users(
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    users = list_users(db)
+    return {
+        "users": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "display_name": u.display_name,
+                "role": u.role,
+                "is_active": u.is_active,
+            }
+            for u in users
+        ]
+    }
+
+
 # ── Tag routes ────────────────────────────────────────────────────────────────
 
 @app.get("/api/tags")
-def get_tags(db: Session = Depends(get_session)) -> dict[str, Any]:
+def get_tags(db: DBSession) -> dict[str, Any]:
     _ensure_db()
     tags = list_tags(db)
     return {"tags": [{"id": t.id, "name": t.name, "slug": t.slug, "color": t.color}
                      for t in tags]}
+
+
+@app.get("/{frontend_path:path}", include_in_schema=False)
+def frontend_fallback(frontend_path: str) -> FileResponse:
+    """Serve React client routes from the production build when available."""
+    blocked_prefixes = ("api/", "auth/", "static/", "assets/")
+    blocked_exact = {"api", "auth", "static", "assets", "docs", "openapi.json"}
+    if frontend_path in blocked_exact or frontend_path.startswith(blocked_prefixes):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if not FRONTEND_INDEX.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return FileResponse(FRONTEND_INDEX)
 
 
 def _result_value(result: Any, key: str, default: Any = None) -> Any:
@@ -552,91 +823,26 @@ def _ensure_db() -> None:
 
 def _safe_get_ticket(db: Session, ticket_id: Any) -> TicketRead | None:
     try:
-        return get_ticket(db, int(ticket_id))
-    except Exception:
+        parsed_ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
         return None
+    return get_ticket(db, parsed_ticket_id)
 
 
-def _ticket_record_model() -> Any:
-    try:
-        return getattr(importlib.import_module("app.db"), "TicketRecord", None)
-    except Exception:
-        return None
+def _resolve_chat_thread_id(user_id: str, requested_thread_id: str | None = None) -> str:
+    prefix = f"user:{user_id}:"
+    if requested_thread_id and requested_thread_id.startswith(prefix):
+        return requested_thread_id
+    return f"{prefix}default"
 
 
-def _list_ticket_records(
-    db: Session,
-    parsed_status: TicketStatus | None,
-    limit: int,
-) -> list[Any]:
-    model = _ticket_record_model()
-    if model is None:
-        return []
-    query = db.query(model)
-    if parsed_status is not None and hasattr(model, "status"):
-        query = query.filter(getattr(model, "status") == parsed_status.value)
-    if hasattr(model, "created_at"):
-        query = query.order_by(getattr(model, "created_at").desc())
-    return query.limit(limit).all()
-
-
-def _get_ticket_record(db: Session, ticket_id: int) -> Any | None:
-    model = _ticket_record_model()
-    if model is None:
-        return None
-    return db.get(model, ticket_id)
-
-
-def _record_to_api(record: Any, include_conversation: bool = False) -> dict[str, Any]:
-    intelligence = getattr(record, "intelligence", None) or {}
-    resolution = getattr(record, "resolution", None) or {}
-    summary = (
-        getattr(record, "summary", None)
-        or intelligence.get("summary")
-        or "IT support request"
-    )
-    priority = (
-        getattr(record, "suggested_priority", None)
-        or intelligence.get("suggested_priority")
-        or "Medium"
-    )
-    category = getattr(record, "category", None) or intelligence.get("category") or "Infra"
-    created_at = getattr(record, "created_at", None)
-    updated_at = getattr(record, "updated_at", None)
-    payload: dict[str, Any] = {
-        "id": record.id,
-        "ticket_id": record.id,
-        "title": summary[:96],
-        "summary": summary,
-        "description": summary,
-        "requester": getattr(record, "user_id", None),
-        "created_by": getattr(record, "user_id", None),
-        "user_id": getattr(record, "user_id", None),
-        "thread_id": getattr(record, "thread_id", None),
-        "status": _status_text_to_api(getattr(record, "status", "")),
-        "state": _status_text_to_api(getattr(record, "status", "")),
-        "priority": str(priority).lower(),
-        "severity": str(priority).lower(),
-        "category": category,
-        "type": category,
-        "keywords": getattr(record, "keywords", None) or intelligence.get("keywords", []),
-        "app_name": getattr(record, "app_name", None),
-        "environment": getattr(record, "environment", None),
-        "created_at": (
-            created_at.isoformat() if hasattr(created_at, "isoformat") else created_at
-        ),
-        "updated_at": (
-            updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at
-        ),
-        "linked_kb_articles": resolution.get("linked_kb_articles", []),
-        "duplicate_ticket_ids": resolution.get("duplicate_ticket_ids", []),
+def _chat_message_to_api(message: Any) -> dict[str, Any]:
+    return {
+        "id": str(message.id),
+        "role": message.role,
+        "content": message.content,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
     }
-    if include_conversation:
-        payload["conversation"] = getattr(record, "conversation", None) or []
-        payload["messages"] = payload["conversation"]
-        payload["guardrail"] = getattr(record, "guardrail", None)
-        payload["raw_context"] = getattr(record, "raw_context", None) or {}
-    return payload
 
 
 def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
@@ -645,13 +851,6 @@ def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
         value = str(item.get(key) or "unknown")
         counts[value] = counts.get(value, 0) + 1
     return counts
-
-
-def _status_text_to_api(value: str) -> str:
-    parsed = _parse_status(value)
-    if parsed is not None:
-        return _status_to_api(parsed)
-    return str(value or "unknown").casefold().replace(" ", "_")
 
 
 def ticket_to_api(ticket: TicketRead, include_conversation: bool = False) -> dict[str, Any]:
