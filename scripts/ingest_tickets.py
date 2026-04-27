@@ -138,7 +138,12 @@ def parse_args() -> argparse.Namespace:
             "severity, status, resolution clean, error codes, and embedding text."
         ),
     )
-    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of tickets to import. Omit (or pass 0) to import all.",
+    )
     parser.add_argument(
         "--start-record",
         type=int,

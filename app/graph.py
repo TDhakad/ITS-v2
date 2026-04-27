@@ -55,6 +55,7 @@ from app.schemas import (
     TicketIntelligence,
     TicketStatus,
     UserClearance,
+    UserRole,
 )
 from app.settings import get_settings
 from app.ticket_vector import search_ticket_vectors
@@ -240,10 +241,17 @@ def analyze_ticket_data(question: str) -> str:
     or "show the matching VPN tickets"). Do not infer exact totals from
     search_existing_tickets or vector_search_tickets.
     """
+    ctx = _request_ctx()
     try:
         from app.admin_analytics import run_admin_analytics_question
 
-        result = run_admin_analytics_question(question)
+        # Scope analytics to the user's project for non-admin roles to prevent
+        # cross-project data leakage.
+        user_role = ctx.get("user_role", UserRole.USER)
+        scope_project_id = (
+            None if user_role == UserRole.ADMIN else ctx.get("project_id")
+        )
+        result = run_admin_analytics_question(question, project_id=scope_project_id)
         return str(result.get("answer") or "No analytics answer was generated.")
     except Exception:
         logger.exception("Ticket analytics failed")
@@ -279,6 +287,7 @@ def vector_search_tickets(
             query,
             user_id=_scoped_ticket_user_id(ctx),
             project_id=ctx.get("project_id"),
+            project_ids=ctx.get("project_ids"),
             tag_slugs=tag_list,
             status=_enum_value(status, TicketStatus),
             priority=_enum_value(priority, Priority),
@@ -470,7 +479,16 @@ def agent_node(state: HelpdeskAgentState) -> dict[str, Any]:
         None,
     )
     intent = _classify_intent(last_human.content if last_human else "")
-    system_content = _SYSTEM_PROMPT + (_INTENT_HINTS.get(intent or "", ""))
+
+    # Build a user-context line so the agent knows who it is talking to.
+    user_ctx = f"User: {ctx.get('display_name', 'User')} (role: {ctx.get('user_role', 'user')})"
+    if ctx.get("project_id") is not None:
+        user_ctx += f", project ID: {ctx['project_id']}"
+    system_content = (
+        _SYSTEM_PROMPT
+        + f"\n\nCurrent session — {user_ctx}."
+        + (_INTENT_HINTS.get(intent or "", ""))
+    )
 
     llm = get_chat_model().bind_tools(_TOOLS)
     messages: list[BaseMessage] = [
@@ -589,6 +607,9 @@ def run_chat_turn(
     environment: Environment = Environment.UNKNOWN,
     clearance: UserClearance = UserClearance.PUBLIC,
     project_id: int | None = None,
+    project_ids: list[int] | None = None,
+    display_name: str = "User",
+    user_role: str = UserRole.USER,
 ) -> ChatTurnResult:
     # Set per-request context — mutable dict shared with tools.
     ctx: dict[str, Any] = {
@@ -598,6 +619,9 @@ def run_chat_turn(
         "environment": environment,
         "user_clearance": clearance,
         "project_id": project_id,
+        "project_ids": project_ids,
+        "display_name": display_name,
+        "user_role": user_role,
         "kb_refs": [],
         "ticket_id": None,
         "messages_snapshot": [],

@@ -128,6 +128,7 @@ def search_ticket_vectors(
     *,
     user_id: str | None = None,
     project_id: int | None = None,
+    project_ids: list[int] | None = None,
     tag_slugs: list[str] | None = None,
     status: str | None = None,
     priority: str | None = None,
@@ -146,6 +147,7 @@ def search_ticket_vectors(
             filter=_ticket_filter(
                 user_id=user_id,
                 project_id=project_id,
+                project_ids=project_ids,
                 status=status,
                 priority=priority,
             ),
@@ -280,14 +282,21 @@ def _ticket_filter(
     *,
     user_id: str | None,
     project_id: int | None,
+    project_ids: list[int] | None = None,
     status: str | None,
     priority: str | None,
 ) -> dict[str, Any] | None:
     clauses: list[dict[str, Any]] = []
     if user_id:
         clauses.append({"user_id": user_id})
+    # project_id (single) takes precedence; fall back to $in for multiple projects.
     if project_id is not None:
         clauses.append({"project_id": project_id})
+    elif project_ids:
+        if len(project_ids) == 1:
+            clauses.append({"project_id": project_ids[0]})
+        else:
+            clauses.append({"project_id": {"$in": project_ids}})
     if status:
         clauses.append({"status": status})
     if priority:

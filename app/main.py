@@ -29,14 +29,20 @@ from app.db import (
     add_chat_turn_messages,
     create_project,
     find_duplicate_candidates,
+    get_project_by_id,
     get_session,
     get_ticket,
+    get_user_by_id,
+    get_user_project_ids,
     init_db,
     list_chat_messages,
     list_chat_threads,
+    list_project_members,
     list_projects,
     list_tags,
     list_tickets,
+    list_users,
+    remove_project_member,
 )
 from app.db import (
     create_ticket as persist_ticket,
@@ -194,8 +200,7 @@ def admin_page(
     request: Request,
     current_user: OptionalUser,
 ) -> Response:
-    if FRONTEND_INDEX.exists():
-        return FileResponse(FRONTEND_INDEX)
+    # Auth checks MUST happen before serving the SPA so /admin stays protected.
     if current_user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -207,6 +212,8 @@ def admin_page(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You don't have permission to perform this action.",
         )
+    if FRONTEND_INDEX.exists():
+        return FileResponse(FRONTEND_INDEX)
     return templates.TemplateResponse(request, "admin.html")
 
 
@@ -275,6 +282,18 @@ def chat_turn(
         resolved_user_id,
         payload.thread_id or payload.conversation_id,
     )
+    # Resolve project: auto-detect from the user's memberships for non-admin users
+    # so the agent is always scoped to the correct project.
+    resolved_project_id = payload.project_id
+    resolved_project_ids: list[int] | None = None
+    if current_user and current_user.role != UserRole.ADMIN:
+        user_project_ids = get_user_project_ids(db, current_user.id)
+        if user_project_ids:
+            resolved_project_ids = user_project_ids
+            if payload.project_id and payload.project_id in user_project_ids:
+                resolved_project_id = payload.project_id
+            else:
+                resolved_project_id = user_project_ids[0]
     try:
         graph = importlib.import_module("app.graph")
         runner = (
@@ -297,7 +316,10 @@ def chat_turn(
                 app_name=payload.app_name,
                 environment=payload.environment,
                 clearance=resolved_clearance,
-                project_id=payload.project_id,
+                project_id=resolved_project_id,
+                project_ids=resolved_project_ids,
+                display_name=current_user.display_name if current_user else "User",
+                user_role=current_user.role.value if current_user else "user",
             )
     except Exception as exc:
         logger.exception("Chat backend unavailable")
@@ -384,6 +406,7 @@ def create_ticket(
 @app.get("/api/tickets")
 def tickets(
     db: DBSession,
+    current_user: OptionalUser,
     status_filter: str | None = Query(default=None, alias="status"),
     user_id: str | None = None,
     project_id: int | None = Query(default=None),
@@ -392,11 +415,31 @@ def tickets(
 ) -> dict[str, list[dict[str, Any]]]:
     _ensure_db()
     parsed_status = _parse_status(status_filter)
+
+    # Scope non-admin users to their project memberships so they never see
+    # tickets that belong to other projects.
+    effective_project_id: int | None = project_id
+    effective_project_ids: list[int] | None = None
+    if current_user and current_user.role != UserRole.ADMIN:
+        user_project_ids = get_user_project_ids(db, current_user.id)
+        if user_project_ids:
+            if project_id and project_id in user_project_ids:
+                effective_project_id = project_id  # honour the requested project
+            elif len(user_project_ids) == 1:
+                effective_project_id = user_project_ids[0]
+            else:
+                effective_project_ids = user_project_ids
+                effective_project_id = None
+        else:
+            # No project memberships — fall back to the user's own tickets only.
+            user_id = str(current_user.id)
+
     try:
         found = list_tickets(
             db,
             parsed_status,
-            project_id=project_id,
+            project_id=effective_project_id,
+            project_ids=effective_project_ids,
             tag_slug=tag_slug,
             user_id=user_id,
             limit=limit,
@@ -649,6 +692,96 @@ def post_project(
     ))
     add_project_member(db, record.id, current_user.id, ProjectAccessLevel.OWNER.value)
     return {"id": record.id, "name": record.name, "slug": record.slug}
+
+
+class AddMemberRequest(BaseModel):
+    user_id: int
+    access_level: ProjectAccessLevel = ProjectAccessLevel.MEMBER
+
+
+@app.get("/api/projects/{project_id}/members")
+def get_project_members(
+    project_id: int,
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    project = get_project_by_id(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+    members = list_project_members(db, project_id)
+    return {
+        "project_id": project_id,
+        "members": [
+            {
+                "user_id": m.user_id,
+                "access_level": m.access_level,
+                "display_name": m.user.display_name if m.user else None,
+                "email": m.user.email if m.user else None,
+            }
+            for m in members
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/members", status_code=status.HTTP_201_CREATED)
+def post_project_member(
+    project_id: int,
+    payload: AddMemberRequest,
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    project = get_project_by_id(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+    target_user = get_user_by_id(db, payload.user_id)
+    if target_user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+    member = add_project_member(db, project_id, payload.user_id, payload.access_level.value)
+    return {
+        "project_id": project_id,
+        "user_id": member.user_id,
+        "access_level": member.access_level,
+    }
+
+
+@app.delete("/api/projects/{project_id}/members/{user_id}",
+            status_code=status.HTTP_204_NO_CONTENT)
+def delete_project_member(
+    project_id: int,
+    user_id: int,
+    db: DBSession,
+    _: AdminUser,
+) -> None:
+    _ensure_db()
+    removed = remove_project_member(db, project_id, user_id)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Membership not found.",
+        )
+
+
+@app.get("/api/users")
+def get_users(
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    users = list_users(db)
+    return {
+        "users": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "display_name": u.display_name,
+                "role": u.role,
+                "is_active": u.is_active,
+            }
+            for u in users
+        ]
+    }
 
 
 # ── Tag routes ────────────────────────────────────────────────────────────────

@@ -130,6 +130,13 @@ _PARSING_ERROR_MESSAGE = (
     "Call one SQL tool, then wait for the real tool result."
 )
 _TRACE_CTX: ContextVar[dict[str, Any] | None] = ContextVar("admin_analytics_trace", default=None)
+# Carries optional project_id scope for non-admin users so all tool calls are restricted.
+_ANALYTICS_SCOPE: ContextVar[dict[str, Any]] = ContextVar("analytics_scope", default={})
+
+# Tools that accept a project_id filter and should be auto-scoped.
+_SCOPED_TOOL_NAMES: frozenset[str] = frozenset(
+    {"count_tickets", "group_tickets", "list_tickets", "ticket_trend", "semantic_ticket_search"}
+)
 
 DateRangeName = Literal[
     "today",
@@ -299,8 +306,15 @@ def answer_admin_analytics_question(question: str) -> str:
     return run_admin_analytics_question(question)["answer"]
 
 
-def run_admin_analytics_question(question: str) -> dict[str, Any]:
-    """Answer an admin analytics question with LangGraph tools and trace metadata."""
+def run_admin_analytics_question(
+    question: str,
+    *,
+    project_id: int | None = None,
+) -> dict[str, Any]:
+    """Answer an admin analytics question with LangGraph tools and trace metadata.
+
+    Pass project_id to restrict all tool calls to a single project (non-admin users).
+    """
 
     clean_question = " ".join(question.split())
     if not clean_question:
@@ -309,6 +323,9 @@ def run_admin_analytics_question(question: str) -> dict[str, Any]:
     trace = _new_trace()
     trace["question"] = clean_question
     token = _TRACE_CTX.set(trace)
+    scope_token = _ANALYTICS_SCOPE.set(
+        {"project_id": project_id} if project_id is not None else {}
+    )
     started = perf_counter()
     try:
         graph = _get_analytics_graph()
@@ -336,23 +353,29 @@ def run_admin_analytics_question(question: str) -> dict[str, Any]:
         return {"answer": answer, "trace": _public_trace(trace)}
     finally:
         _TRACE_CTX.reset(token)
+        _ANALYTICS_SCOPE.reset(scope_token)
 
 
 def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
     trace["path"] = "sql_agent_fallback"
+    # Inject scope hint so the SQL agent respects the project filter.
+    scope = _ANALYTICS_SCOPE.get({})
+    scoped_question = clean_question
+    if scope.get("project_id") is not None:
+        scoped_question = f"{clean_question} [Mandatory filter: project_id = {scope['project_id']}]"
 
     agent = _get_sql_agent()
-    result = agent.invoke({"input": clean_question})
+    result = agent.invoke({"input": scoped_question})
     output = result.get("output") if isinstance(result, dict) else result
     answer = str(output or "No answer was generated.").strip()
     if isinstance(result, dict):
         sql_result = _last_successful_sql_result(result.get("intermediate_steps"))
         if sql_result:
             sql, rows = sql_result
-            return _summarize_sql_result(clean_question, sql, rows)
+            return _summarize_sql_result(scoped_question, sql, rows)
         logger.warning("SQL agent produced no verified sql_db_query result.")
     if _AGENT_STOPPED_OUTPUT in answer and isinstance(result, dict):
-        return _recover_from_intermediate_steps(clean_question, result)
+        return _recover_from_intermediate_steps(scoped_question, result)
     if isinstance(result, dict):
         return (
             "I could not verify that answer against the database. "
@@ -714,9 +737,18 @@ def _get_analytics_graph() -> Any:
 
 
 def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
+    scope = _ANALYTICS_SCOPE.get({})
+    scope_instruction = ""
+    if scope.get("project_id") is not None:
+        scope_instruction = (
+            f"\n\nMANDATORY SCOPE: You are answering for a project-scoped user. "
+            f"ALL tool calls MUST include project_id={scope['project_id']}. "
+            f"Never return data from other projects."
+        )
+    prompt = ANALYTICS_GRAPH_PROMPT.replace("{today}", _today_iso()) + scope_instruction
     llm = get_chat_model().bind_tools(_get_admin_tools())
     messages = [
-        SystemMessage(content=ANALYTICS_GRAPH_PROMPT.replace("{today}", _today_iso())),
+        SystemMessage(content=prompt),
         *state.get("messages", []),
     ]
     return {"messages": [llm.invoke(messages)]}
@@ -729,9 +761,14 @@ def _analytics_tools_node(state: AdminAnalyticsState) -> dict[str, Any]:
 
     tools = {tool.name: tool for tool in _get_admin_tools()}
     messages: list[ToolMessage] = []
+    scope = _ANALYTICS_SCOPE.get({})
     for call in last.tool_calls:
         name = call["name"]
-        args = call.get("args") or {}
+        args = dict(call.get("args") or {})
+        # Enforce project scope at the tool-call level (reliable fallback in case
+        # the LLM omits the project_id filter despite the prompt instruction).
+        if scope.get("project_id") is not None and name in _SCOPED_TOOL_NAMES:
+            args["project_id"] = scope["project_id"]
         tool_id = call["id"]
         started = perf_counter()
         selected = tools.get(name)

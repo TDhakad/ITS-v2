@@ -27,6 +27,7 @@ from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
     Session,
+    aliased,
     mapped_column,
     relationship,
     selectinload,
@@ -440,28 +441,35 @@ def list_chat_threads(
     limit: int = 30,
 ) -> list[dict[str, Any]]:
     """Return the most-recently-active chat threads for a user with a preview."""
-    # One subquery row per thread: the latest message timestamp and total count.
-    from sqlalchemy import func, case
+    from sqlalchemy import func
 
-    subq = (
+    inner = aliased(ChatMessageRecord)
+    # Correlated subquery: content of the MOST RECENT user message per thread.
+    preview_subq = (
+        select(inner.content)
+        .where(
+            inner.user_id == user_id,
+            inner.thread_id == ChatMessageRecord.thread_id,
+            inner.role == "user",
+        )
+        .order_by(inner.created_at.desc())
+        .limit(1)
+        .correlate(ChatMessageRecord)
+        .scalar_subquery()
+    )
+    stmt = (
         select(
             ChatMessageRecord.thread_id,
             func.max(ChatMessageRecord.created_at).label("last_at"),
             func.count(ChatMessageRecord.id).label("message_count"),
-            func.min(
-                case(
-                    (ChatMessageRecord.role == "user", ChatMessageRecord.content),
-                    else_=None,
-                )
-            ).label("preview"),
+            preview_subq.label("preview"),
         )
         .where(ChatMessageRecord.user_id == user_id)
         .group_by(ChatMessageRecord.thread_id)
         .order_by(func.max(ChatMessageRecord.created_at).desc())
         .limit(limit)
-        .subquery()
     )
-    rows = db.execute(select(subq)).mappings().all()
+    rows = db.execute(stmt).mappings().all()
     return [
         {
             "thread_id": row["thread_id"],
@@ -471,6 +479,17 @@ def list_chat_threads(
         }
         for row in rows
     ]
+
+
+def get_user_project_ids(db: Session, user_id: int) -> list[int]:
+    """Return IDs of all active projects the user is a member of."""
+    return list(
+        db.scalars(
+            select(ProjectMemberRecord.project_id).where(
+                ProjectMemberRecord.user_id == user_id
+            )
+        ).all()
+    )
 
 
 def list_chat_messages(
@@ -667,6 +686,7 @@ def list_tickets(
     status: TicketStatus | None = None,
     *,
     project_id: int | None = None,
+    project_ids: list[int] | None = None,
     tag_slug: str | None = None,
     priority: str | None = None,
     category: str | None = None,
@@ -678,6 +698,8 @@ def list_tickets(
         stmt = stmt.where(TicketRecord.status == status.value)
     if project_id is not None:
         stmt = stmt.where(TicketRecord.project_id == project_id)
+    elif project_ids is not None:
+        stmt = stmt.where(TicketRecord.project_id.in_(project_ids))
     if priority:
         stmt = stmt.where(TicketRecord.suggested_priority == priority)
     if category:
@@ -1054,6 +1076,37 @@ def add_project_member(db: Session, project_id: int, user_id: int,
     db.add(record)
     db.commit()
     return record
+
+
+def remove_project_member(db: Session, project_id: int, user_id: int) -> bool:
+    """Remove a user from a project. Returns True if the membership existed."""
+    record = db.scalars(
+        select(ProjectMemberRecord)
+        .where(ProjectMemberRecord.project_id == project_id)
+        .where(ProjectMemberRecord.user_id == user_id)
+    ).first()
+    if not record:
+        return False
+    db.delete(record)
+    db.commit()
+    return True
+
+
+def list_project_members(db: Session, project_id: int) -> list[ProjectMemberRecord]:
+    return list(
+        db.scalars(
+            select(ProjectMemberRecord)
+            .where(ProjectMemberRecord.project_id == project_id)
+            .order_by(ProjectMemberRecord.id)
+        ).all()
+    )
+
+
+def list_users(db: Session, *, active_only: bool = True) -> list[UserRecord]:
+    stmt = select(UserRecord).order_by(UserRecord.display_name)
+    if active_only:
+        stmt = stmt.where(UserRecord.is_active.is_(True))
+    return list(db.scalars(stmt).all())
 
 
 # ── Tag helpers ────────────────────────────────────────────────────────────────
