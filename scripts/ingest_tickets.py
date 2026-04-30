@@ -19,19 +19,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.db import SessionLocal, TagRecord, create_tickets, init_db, list_tickets  # noqa: E402
-from app.schemas import (  # noqa: E402
-    ChatMessage,
-    Environment,
-    Priority,
-    ResolutionData,
-    TicketCategory,
-    TicketCreate,
-    TicketIntelligence,
-    TicketStatus,
-    UserClearance,
-)
-from app.ticket_vector import DEFAULT_TICKET_INDEX_NAME, index_tickets  # noqa: E402
+from app.db import (SessionLocal, TagRecord, create_tickets,  # noqa: E402
+                    init_db, list_tickets)
+from app.schemas import (ChatMessage, Environment, Priority,  # noqa: E402
+                         ResolutionData, TicketCategory, TicketCreate,
+                         TicketIntelligence, TicketStatus, UserClearance)
+from app.ticket_vector import (DEFAULT_TICKET_INDEX_NAME,  # noqa: E402
+                               index_tickets)
 
 MAX_SUMMARY_CHARS = 1_200
 MAX_MESSAGE_CHARS = 8_000
@@ -81,8 +75,17 @@ COLUMN_ALIASES = {
         "resolution_clean",
         "resolution",
     ),
-    "suggested_fixes": ("suggested_fixes", "fixes", "resolution_steps", "resolution_clean"),
-    "duplicate_ticket_ids": ("duplicate_ticket_ids", "duplicates", "related_ticket_ids"),
+    "suggested_fixes": (
+        "suggested_fixes",
+        "fixes",
+        "resolution_steps",
+        "resolution_clean",
+    ),
+    "duplicate_ticket_ids": (
+        "duplicate_ticket_ids",
+        "duplicates",
+        "related_ticket_ids",
+    ),
     "created_at": ("created_at", "created", "opened_at", "opened"),
     "updated_at": ("updated_at", "updated", "last_updated", "modified_at"),
     "embedding_text": ("embedding_text",),
@@ -317,7 +320,9 @@ def persist_ticket_batch(
     if not index_vectors:
         return
     try:
-        report.indexed += index_tickets(created, reset=False, batch_size=vector_batch_size)
+        report.indexed += index_tickets(
+            created, reset=False, batch_size=vector_batch_size
+        )
     except Exception as exc:
         report.index_errors.append(str(exc))
 
@@ -336,7 +341,9 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
     embedding_text = clean_text(first_value(values, "embedding_text"))
     description = clean_text(first_value(values, "description"))
     vector_description = embedding_text or description
-    summary = clean_text(first_value(values, "summary")) or first_sentence(vector_description)
+    summary = clean_text(first_value(values, "summary")) or first_sentence(
+        vector_description
+    )
     if not summary:
         raise ValueError("missing summary/title/description")
 
@@ -347,7 +354,9 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
     keywords.extend(parse_list(first_value(values, "error_codes")))
     keywords.extend(value for value in [app_name, issue_type] if value)
     if not keywords:
-        keywords = infer_keywords(" ".join([summary, vector_description, category_text]))
+        keywords = infer_keywords(
+            " ".join([summary, vector_description, category_text])
+        )
 
     tags = [slugify(value) for value in parse_list(first_value(values, "tags"))]
     if not tags:
@@ -363,7 +372,9 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
         conversation = [
             ChatMessage(
                 role="user",
-                content=truncate(description or vector_description or summary, MAX_MESSAGE_CHARS),
+                content=truncate(
+                    description or vector_description or summary, MAX_MESSAGE_CHARS
+                ),
                 created_at=created_at or datetime.now(UTC),
             )
         ]
@@ -379,7 +390,8 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
 
     return TicketCreate(
         user_id=clean_text(first_value(values, "user_id")) or DEFAULT_IMPORT_USER,
-        thread_id=clean_text(first_value(values, "thread_id")) or f"csv-row-{row_number}",
+        thread_id=clean_text(first_value(values, "thread_id"))
+        or f"csv-row-{row_number}",
         status=parse_status(first_value(values, "status")),
         app_name=app_name,
         environment=parse_environment(first_value(values, "environment")),
@@ -394,7 +406,9 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
             confidence=parse_confidence(first_value(values, "confidence")),
         ),
         resolution=ResolutionData(
-            duplicate_ticket_ids=parse_int_list(first_value(values, "duplicate_ticket_ids")),
+            duplicate_ticket_ids=parse_int_list(
+                first_value(values, "duplicate_ticket_ids")
+            ),
             suggested_fixes=parse_list(first_value(values, "suggested_fixes"))[:10],
         ),
         conversation=conversation[:200],
@@ -423,7 +437,9 @@ def print_import_report(report: ImportReport) -> None:
         f"index_errors: {len(report.index_errors)}",
     ]
     if report.created_ticket_ids:
-        shown_ids = ", ".join(str(ticket_id) for ticket_id in report.created_ticket_ids[:20])
+        shown_ids = ", ".join(
+            str(ticket_id) for ticket_id in report.created_ticket_ids[:20]
+        )
         lines.append(f"ticket_ids: {shown_ids}")
     if report.errors:
         lines.extend(report.errors[:10])
@@ -436,7 +452,9 @@ def ensure_tag_slugs(db, slugs: Sequence[str]) -> None:
     wanted = [slug for slug in dedupe(slugs) if slug]
     if not wanted:
         return
-    existing = set(db.scalars(select(TagRecord.slug).where(TagRecord.slug.in_(wanted))).all())
+    existing = set(
+        db.scalars(select(TagRecord.slug).where(TagRecord.slug.in_(wanted))).all()
+    )
     for slug in wanted:
         if slug not in existing:
             db.add(TagRecord(name=slug.replace("-", " ").title(), slug=slug))
@@ -448,7 +466,9 @@ def normalize_row(row: Mapping[str, Any]) -> dict[str, str]:
     for key, value in row.items():
         if key is None:
             continue
-        normalized[normalize_key(str(key))] = "" if value is None else str(value).strip()
+        normalized[normalize_key(str(key))] = (
+            "" if value is None else str(value).strip()
+        )
     return normalized
 
 
@@ -570,7 +590,9 @@ def parse_enum(enum_type, value: str, default, aliases: Mapping[str, Any]):
     if not value:
         return default
     normalized = compact(value)
-    normalized_aliases = {compact(alias): enum_value for alias, enum_value in aliases.items()}
+    normalized_aliases = {
+        compact(alias): enum_value for alias, enum_value in aliases.items()
+    }
     if normalized in normalized_aliases:
         return normalized_aliases[normalized]
     for member in enum_type:
@@ -583,7 +605,9 @@ def parse_enum(enum_type, value: str, default, aliases: Mapping[str, Any]):
             except ValueError:
                 pass
     allowed = ", ".join(member.value for member in enum_type)
-    raise ValueError(f"invalid {enum_type.__name__} {value!r}; expected one of: {allowed}")
+    raise ValueError(
+        f"invalid {enum_type.__name__} {value!r}; expected one of: {allowed}"
+    )
 
 
 def parse_conversation(value: str) -> list[ChatMessage]:
@@ -602,18 +626,23 @@ def parse_conversation(value: str) -> list[ChatMessage]:
     messages: list[ChatMessage] = []
     for item in parsed:
         if isinstance(item, str):
-            messages.append(ChatMessage(role="user", content=truncate(item, MAX_MESSAGE_CHARS)))
+            messages.append(
+                ChatMessage(role="user", content=truncate(item, MAX_MESSAGE_CHARS))
+            )
             continue
         if not isinstance(item, Mapping):
             continue
-        content = clean_text(item.get("content") or item.get("message") or item.get("text"))
+        content = clean_text(
+            item.get("content") or item.get("message") or item.get("text")
+        )
         if not content:
             continue
         messages.append(
             ChatMessage(
                 role=clean_text(item.get("role")) or "user",
                 content=truncate(content, MAX_MESSAGE_CHARS),
-                created_at=parse_datetime(clean_text(item.get("created_at"))) or datetime.now(UTC),
+                created_at=parse_datetime(clean_text(item.get("created_at")))
+                or datetime.now(UTC),
             )
         )
     return messages
@@ -632,7 +661,9 @@ def parse_list(value: str) -> list[str]:
 
 
 def parse_int_list(value: str) -> list[int]:
-    return [parsed for item in parse_list(value) if (parsed := parse_int(item)) is not None]
+    return [
+        parsed for item in parse_list(value) if (parsed := parse_int(item)) is not None
+    ]
 
 
 def parse_int(value: str) -> int | None:
@@ -668,7 +699,13 @@ def parse_datetime(value: str) -> datetime | None:
             return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
         except ValueError:
             pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%m/%d/%Y %H:%M"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%m-%d-%Y",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M",
+    ):
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=UTC)
         except ValueError:
@@ -678,7 +715,7 @@ def parse_datetime(value: str) -> datetime | None:
 
 def parse_json(value: str) -> Any | None:
     text = value.strip()
-    if not text or text[0] not in "[{\"":
+    if not text or text[0] not in '[{"':
         return None
     try:
         return json.loads(text)

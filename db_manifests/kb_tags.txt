@@ -1,0 +1,20 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE kb_tags (
+	id INTEGER NOT NULL, 
+	kb_id VARCHAR(255) NOT NULL, 
+	tag_id INTEGER NOT NULL, 
+	PRIMARY KEY (id), 
+	CONSTRAINT uq_kb_tag UNIQUE (kb_id, tag_id), 
+	FOREIGN KEY(tag_id) REFERENCES tags (id) ON DELETE CASCADE
+)
+
+Column Details:
+-- id: Primary key for KB-tag link row.
+-- kb_id: Knowledge-base document identifier.
+-- tag_id: Foreign key to tags.id.
+
+HINTS: 
+To join 'kb_tags' and 'tags', use kb_tags.tag_id = tags.id

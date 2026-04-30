@@ -1,0 +1,24 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE tags (
+	id INTEGER NOT NULL, 
+	name VARCHAR(60) NOT NULL, 
+	slug VARCHAR(60) NOT NULL, 
+	color VARCHAR(20) NOT NULL, 
+	description VARCHAR(500) NOT NULL, 
+	PRIMARY KEY (id), 
+	UNIQUE (name)
+)
+
+Column Details:
+-- id: Primary key for tag record.
+-- name: Unique display name for the tag.
+-- slug: Unique URL-safe tag identifier.
+-- color: Hex color code used for tag badges.
+-- description: Optional tag description.
+
+HINTS: 
+To join 'tags' and 'ticket_tags', use tags.id = ticket_tags.tag_id
+To join 'kb_tags' and 'tags', use kb_tags.tag_id = tags.id

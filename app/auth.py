@@ -10,6 +10,7 @@ FastAPI dependency:
   get_current_user  → required auth (raises 401 if not logged in)
   get_optional_user → optional auth (returns None if not logged in)
 """
+
 from __future__ import annotations
 
 import os
@@ -21,17 +22,9 @@ import bcrypt
 from fastapi import Cookie, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.db import (
-    UserRecord,
-    create_auth_session,
-    create_user,
-    delete_auth_session,
-    get_auth_session,
-    get_session,
-    get_user_by_email,
-    get_user_by_id,
-    record_login,
-)
+from app.db import (UserRecord, create_auth_session, create_user,
+                    delete_auth_session, get_auth_session, get_session,
+                    get_user_by_email, get_user_by_id, record_login)
 from app.schemas import UserClearance, UserRead, UserRole
 
 SESSION_COOKIE = "session_token"
@@ -40,6 +33,7 @@ TOKEN_BYTES = 32  # 256-bit opaque token
 
 
 # ── Password helpers ───────────────────────────────────────────────────────────
+
 
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
@@ -53,6 +47,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 # ── Session helpers ────────────────────────────────────────────────────────────
+
 
 def _new_token() -> str:
     return secrets.token_hex(TOKEN_BYTES)
@@ -77,25 +72,47 @@ def _record_to_read(record: UserRecord) -> UserRead:
 
 # ── Public auth functions ──────────────────────────────────────────────────────
 
-def login(db: Session, email: str, password: str, *,
-          user_agent: str = "", ip_address: str = "") -> tuple[UserRead, str]:
+
+def login(
+    db: Session,
+    email: str,
+    password: str,
+    *,
+    user_agent: str = "",
+    ip_address: str = "",
+) -> tuple[UserRead, str]:
     """Validate credentials and create a session. Returns (UserRead, token)."""
     record = get_user_by_email(db, email)
-    if not record or not record.is_active or not verify_password(password, record.hashed_password):
+    if (
+        not record
+        or not record.is_active
+        or not verify_password(password, record.hashed_password)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
         )
     token = _new_token()
-    create_auth_session(db, record.id, token, _expires_at(),
-                        user_agent=user_agent, ip_address=ip_address)
+    create_auth_session(
+        db,
+        record.id,
+        token,
+        _expires_at(),
+        user_agent=user_agent,
+        ip_address=ip_address,
+    )
     record_login(db, record)
     return _record_to_read(record), token
 
 
-def register(db: Session, email: str, display_name: str, password: str,
-             role: str = UserRole.USER.value,
-             clearance: str = UserClearance.PUBLIC.value) -> UserRead:
+def register(
+    db: Session,
+    email: str,
+    display_name: str,
+    password: str,
+    role: str = UserRole.USER.value,
+    clearance: str = UserClearance.PUBLIC.value,
+) -> UserRead:
     """Create a new user. Raises 409 if email already exists."""
     existing = get_user_by_email(db, email)
     if existing:
@@ -103,8 +120,9 @@ def register(db: Session, email: str, display_name: str, password: str,
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with that email already exists.",
         )
-    record = create_user(db, email, display_name, hash_password(password),
-                         role=role, clearance=clearance)
+    record = create_user(
+        db, email, display_name, hash_password(password), role=role, clearance=clearance
+    )
     return _record_to_read(record)
 
 
@@ -112,7 +130,9 @@ def logout(db: Session, token: str) -> None:
     delete_auth_session(db, token)
 
 
-def change_password(db: Session, user_id: int, current_password: str, new_password: str) -> None:
+def change_password(
+    db: Session, user_id: int, current_password: str, new_password: str
+) -> None:
     """Change password for the authenticated user. Raises 401 if current password is wrong."""
     record = get_user_by_id(db, user_id)
     if not record or not verify_password(current_password, record.hashed_password):
@@ -138,8 +158,10 @@ def admin_reset_password(db: Session, email: str, new_password: str) -> None:
 
 # ── FastAPI dependencies ───────────────────────────────────────────────────────
 
-def _resolve_token(request: Request,
-                   session_token: Optional[str] = Cookie(default=None)) -> str | None:
+
+def _resolve_token(
+    request: Request, session_token: Optional[str] = Cookie(default=None)
+) -> str | None:
     # Also accept Bearer token in Authorization header for API clients.
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
@@ -181,6 +203,7 @@ def get_current_user(
 
 def require_role(*roles: UserRole):
     """Dependency factory — e.g. Depends(require_role(UserRole.ADMIN))."""
+
     def _check(current_user: UserRead = Depends(get_current_user)) -> UserRead:
         if current_user.role not in roles:
             raise HTTPException(
@@ -188,4 +211,5 @@ def require_role(*roles: UserRole):
                 detail="You don't have permission to perform this action.",
             )
         return current_user
+
     return _check

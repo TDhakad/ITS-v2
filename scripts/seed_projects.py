@@ -4,6 +4,7 @@ Usage:
     uv run python scripts/seed_projects.py
     uv run python scripts/seed_projects.py --assign-admin admin@its.local
 """
+
 from __future__ import annotations
 
 import argparse
@@ -12,14 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.db import (
-    SessionLocal,
-    add_project_member,
-    create_project,
-    get_user_by_email,
-    init_db,
-    list_projects,
-)
+from app.db import (SessionLocal, add_project_member, create_project,
+                    get_user_by_email, init_db, list_projects)
 from app.schemas import ProjectAccessLevel, ProjectCreate
 
 MOCK_PROJECTS: list[dict[str, str]] = [
@@ -62,7 +57,9 @@ def seed(assign_to_email: str | None = None) -> None:
         if assign_to_email:
             owner_user = get_user_by_email(db, assign_to_email)
             if owner_user is None:
-                print(f"[warn] User not found: {assign_to_email} — projects will have no owner.")
+                print(
+                    f"[warn] User not found: {assign_to_email} — projects will have no owner."
+                )
 
         created = 0
         for spec in MOCK_PROJECTS:
@@ -83,14 +80,20 @@ def seed(assign_to_email: str | None = None) -> None:
                 add_project_member(
                     db, record.id, owner_user.id, ProjectAccessLevel.OWNER.value
                 )
-            print(f"[ok]   Created project '{record.name}' (id={record.id}, slug={record.slug})")
+            print(
+                f"[ok]   Created project '{record.name}' (id={record.id}, slug={record.slug})"
+            )
             created += 1
 
-        print(f"\nDone. {created} project(s) created, {len(MOCK_PROJECTS) - created} skipped.")
+        print(
+            f"\nDone. {created} project(s) created, {len(MOCK_PROJECTS) - created} skipped."
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Seed mock projects into ITS Helpdesk.")
+    parser = argparse.ArgumentParser(
+        description="Seed mock projects into ITS Helpdesk."
+    )
     parser.add_argument(
         "--assign-admin",
         metavar="EMAIL",

@@ -48,10 +48,20 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     return undefined as T;
   }
 
-  return (await response.json()) as T;
+  const rawBody = await response.text();
+  if (!rawBody) {
+    return undefined as T;
+  }
+
+  try {
+    return JSON.parse(rawBody) as T;
+  } catch {
+    throw new ApiError(nonJsonResponseMessage(rawBody), response.status);
+  }
 }
 
 async function readError(response: Response): Promise<string> {
+  const cloned = response.clone();
   try {
     const payload = (await response.json()) as { detail?: unknown; message?: unknown };
     const detail = payload.detail ?? payload.message;
@@ -69,9 +79,26 @@ async function readError(response: Response): Promise<string> {
         .join("; ");
     }
   } catch {
-    // Fall through to generic status text.
+    const rawBody = await cloned.text();
+    if (rawBody) {
+      return nonJsonResponseMessage(rawBody);
+    }
   }
   return response.statusText || "Request failed.";
+}
+
+function nonJsonResponseMessage(rawBody: string): string {
+  const normalized = rawBody.trim().toLowerCase();
+  if (normalized.startsWith("<!doctype") || normalized.startsWith("<html")) {
+    return (
+      "Received HTML instead of API JSON. The frontend is likely pointing to the static server "
+      + "instead of the backend API. Set VITE_API_BASE_URL to your FastAPI origin (for example "
+      + "http://localhost:8000) and rebuild the frontend."
+    );
+  }
+
+  const compact = rawBody.replace(/\s+/g, " ").trim();
+  return compact.slice(0, 220) || "Request failed.";
 }
 
 export const api = {
@@ -116,6 +143,12 @@ export const api = {
     ),
 
   getChatThreads: () => request<ChatThreadsResponse>("/api/chat/threads"),
+
+  deleteChatThread: (threadId: string) =>
+    request<void>(`/api/chat/threads/${encodeURIComponent(threadId)}`, {
+      method: "DELETE",
+      skipJson: true
+    }),
 
   createTicket: (payload: CreateTicketPayload) =>
     request<CreateTicketResponse>("/api/tickets", {

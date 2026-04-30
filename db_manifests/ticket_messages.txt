@@ -1,0 +1,23 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE ticket_messages (
+	id INTEGER NOT NULL, 
+	ticket_id INTEGER NOT NULL, 
+	role VARCHAR(40) NOT NULL, 
+	content TEXT NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(ticket_id) REFERENCES tickets (id) ON DELETE CASCADE
+)
+
+Column Details:
+-- id: Primary key for the ticket message row.
+-- ticket_id: Foreign key to tickets.id.
+-- role: Message author role. Available options: user, assistant, system.
+-- content: Message text for the ticket conversation.
+-- created_at: UTC timestamp when the ticket message was created.
+
+HINTS: 
+To join 'ticket_messages' and 'tickets', use ticket_messages.ticket_id = tickets.id

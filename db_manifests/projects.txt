@@ -1,0 +1,29 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE projects (
+	id INTEGER NOT NULL, 
+	name VARCHAR(120) NOT NULL, 
+	slug VARCHAR(80) NOT NULL, 
+	description TEXT NOT NULL, 
+	owner_id INTEGER, 
+	is_active BOOLEAN NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	UNIQUE (name), 
+	FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE SET NULL
+)
+
+Column Details:
+-- id: Primary key for the project record.
+-- name: Unique human-friendly project name.
+-- slug: Unique URL-safe project identifier.
+-- description: Project description shown in management views.
+-- owner_id: Owning user id; nullable when owner is removed.
+-- is_active: Soft-enable flag for project availability.
+-- created_at: UTC timestamp when the project was created.
+
+HINTS: 
+To join 'project_members' and 'projects', use project_members.project_id = projects.id
+To join 'kb_project_links' and 'projects', use kb_project_links.project_id = projects.id

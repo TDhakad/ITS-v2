@@ -99,6 +99,7 @@ export interface ChatResponse {
   citations?: KBReference[];
   references?: KBReference[];
   ticket?: Ticket;
+  agent_response?: AgentResponse | null;
 }
 
 export interface ChatHistoryMessage {
@@ -106,6 +107,7 @@ export interface ChatHistoryMessage {
   role: "user" | "assistant";
   content: string;
   created_at?: string | null;
+  agent_response?: AgentResponse | null;
 }
 
 export interface ChatHistoryResponse {
@@ -151,4 +153,21 @@ export interface ChatMessage {
   createdAt: string;
   citations?: KBReference[];
   ticket?: Ticket;
+  agentResponse?: AgentResponse | null;
+}
+
+// ── Chart / structured agent response ─────────────────────────────────────────
+
+export interface ChartConfiguration {
+  chart_type: "line" | "bar";
+  title: string;
+  data: Record<string, unknown>[];
+  x_axis_key: string;
+  data_keys: string[];
+  colors?: string[] | null;
+}
+
+export interface AgentResponse {
+  markdown_text?: string | null;
+  chart?: ChartConfiguration | null;
 }

@@ -4,7 +4,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 
 
 def utcnow() -> datetime:
@@ -119,7 +120,9 @@ class SelfResolutionAnswer(AppModel):
     @model_validator(mode="after")
     def require_escalation_reason(self) -> SelfResolutionAnswer:
         if self.should_escalate and not self.escalation_reason:
-            raise ValueError("escalation_reason is required when should_escalate is true")
+            raise ValueError(
+                "escalation_reason is required when should_escalate is true"
+            )
         return self
 
 
@@ -146,6 +149,7 @@ class ResolutionData(AppModel):
 
 
 # ── Auth & identity ────────────────────────────────────────────────────────────
+
 
 class UserRole(StrEnum):
     USER = "user"
@@ -193,6 +197,7 @@ class SessionRead(AppModel):
 
 # ── Projects ───────────────────────────────────────────────────────────────────
 
+
 class ProjectCreate(AppModel):
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9-]+$")
@@ -219,8 +224,14 @@ class ProjectMemberAdd(AppModel):
 # ── Tags ───────────────────────────────────────────────────────────────────────
 
 DEFAULT_TAG_SLUGS = [
-    "ui", "hardware", "access", "infra", "security",
-    "network", "performance", "data",
+    "ui",
+    "hardware",
+    "access",
+    "infra",
+    "security",
+    "network",
+    "performance",
+    "data",
 ]
 
 TAG_COLORS: dict[str, str] = {
@@ -251,6 +262,7 @@ class TagRead(AppModel):
 
 
 # ── Updated ticket models ──────────────────────────────────────────────────────
+
 
 class TicketCreate(AppModel):
     user_id: str = Field(min_length=1, max_length=120)
@@ -295,6 +307,7 @@ class ChatTurnResult(AppModel):
     route: Literal["follow_up", "self_resolution", "ticket_created", "blocked"]
     ticket_id: int | None = None
     linked_kb_articles: list[KBArticleRef] = Field(default_factory=list, max_length=10)
+    agent_response: AgentResponse | None = None
 
 
 def append_chat_messages(
@@ -320,3 +333,24 @@ class HelpdeskGraphState(TypedDict, total=False):
     ticket: TicketRead
     final_response: ChatTurnResult
     route: str
+
+
+# ── Chart / structured agent response ─────────────────────────────────────────
+
+
+class ChartConfiguration(BaseModel):
+    """Describes a chart to be rendered by the frontend."""
+
+    chart_type: Literal["line", "bar"]
+    title: str
+    data: list[dict[str, Any]]
+    x_axis_key: str
+    data_keys: list[str]
+    colors: list[str] | None = None
+
+
+class AgentResponse(BaseModel):
+    """Top-level structured response returned by the analytics agent."""
+
+    markdown_text: str | None = None
+    chart: ChartConfiguration | None = None

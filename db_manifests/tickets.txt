@@ -1,0 +1,54 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE tickets (
+	id INTEGER NOT NULL, 
+	status VARCHAR(40) NOT NULL, 
+	user_id VARCHAR(120) NOT NULL, 
+	thread_id VARCHAR(120) NOT NULL, 
+	app_name VARCHAR(120), 
+	environment VARCHAR(40) NOT NULL, 
+	user_clearance VARCHAR(40) NOT NULL, 
+	category VARCHAR(128) NOT NULL, 
+	suggested_priority VARCHAR(40) NOT NULL, 
+	summary TEXT NOT NULL, 
+	keywords JSON NOT NULL, 
+	intelligence JSON NOT NULL, 
+	resolution JSON NOT NULL, 
+	guardrail JSON, 
+	conversation JSON NOT NULL, 
+	raw_context JSON NOT NULL, 
+	project_id INTEGER, 
+	sentiment VARCHAR(40) NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(project_id) REFERENCES projects (id) ON DELETE SET NULL
+)
+
+Column Details:
+-- id: Primary key for ticket record.
+-- status: Lifecycle status of the ticket. Available options: Open, Triaged, In Progress, Resolved, Closed.
+-- user_id: Creator identifier for the ticket.
+-- thread_id: Conversation thread id linked to ticket creation.
+-- app_name: Application/service name related to the issue.
+-- environment: Target runtime environment. Available options: production, staging, development, unknown.
+-- user_clearance: Clearance level attached to the ticket. Available options: public, internal, restricted.
+-- category: Classified ticket category. Available options: Bug, Feature, UI, Infra, Hardware.
+-- suggested_priority: Suggested impact priority. Available options: Low, Medium, High, Critical.
+-- summary: Normalized short summary of the ticket issue.
+-- keywords: Extracted keyword list used for search and analytics.
+-- intelligence: Structured classification and triage metadata.
+-- resolution: Structured resolution suggestions and linked references.
+-- guardrail: Optional safety/guardrail decision payload.
+-- conversation: Legacy JSON conversation cache retained for backward compatibility.
+-- raw_context: Original request context captured at ticket creation.
+-- project_id: Owning project id for tenant scoping; nullable for legacy tickets.
+-- sentiment: Legacy sentiment label retained for older database compatibility.
+-- created_at: UTC timestamp when the ticket was created.
+-- updated_at: UTC timestamp of the latest ticket update.
+
+HINTS: 
+To join 'ticket_tags' and 'tickets', use ticket_tags.ticket_id = tickets.id
+To join 'ticket_messages' and 'tickets', use ticket_messages.ticket_id = tickets.id

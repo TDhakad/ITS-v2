@@ -5,30 +5,27 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import re
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from time import perf_counter
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, List, Literal, TypedDict
 
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langchain_community.utilities import SQLDatabase
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
+                                     SystemMessage, ToolMessage)
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import create_engine, event
 
-from app.llm import get_chat_model
+from app.llm import get_chat_model, get_embedding_model
+from app.rag_ingest import get_vectorstore
 from app.schemas import Priority, TicketCategory, TicketStatus
 from app.settings import get_settings
 from app.ticket_vector import search_ticket_vectors
@@ -127,13 +124,21 @@ _PARSING_ERROR_MESSAGE = (
     "Invalid tool-call format. Do not invent Action, Observation, schema, or row-count text. "
     "Call one SQL tool, then wait for the real tool result."
 )
-_TRACE_CTX: ContextVar[dict[str, Any] | None] = ContextVar("admin_analytics_trace", default=None)
+_TRACE_CTX: ContextVar[dict[str, Any] | None] = ContextVar(
+    "admin_analytics_trace", default=None
+)
 # Carries optional project_id scope for non-admin users so all tool calls are restricted.
 _ANALYTICS_SCOPE: ContextVar[dict[str, Any]] = ContextVar("analytics_scope", default={})
 
 # Tools that accept a project_id filter and should be auto-scoped.
 _SCOPED_TOOL_NAMES: frozenset[str] = frozenset(
-    {"count_tickets", "group_tickets", "list_tickets", "ticket_trend", "semantic_ticket_search"}
+    {
+        "count_tickets",
+        "group_tickets",
+        "list_tickets",
+        "ticket_trend",
+        "semantic_ticket_search",
+    }
 )
 
 DateRangeName = Literal[
@@ -173,28 +178,32 @@ Use tools before answering factual analytics questions.
 IMPORTANT: Return your final answer immediately after the FIRST tool result that answers
 the question. Do not call additional tools unless the first result was clearly insufficient.
 
-Tool guidance:
-- count_tickets → exact ticket counts.
-- group_tickets → breakdowns by status, priority, category, user, app, environment, or project.
-- list_tickets → fetch matching ticket rows (use after counting, or when asked to show tickets).
-- ticket_trend → time-series counts by day/week/month.
-- semantic_ticket_search → themes, similar incidents, recurring complaints (approximate, not for exact counts).
-- run_read_only_sql → last resort only, when no structured tool can express the question.
+Here are the schemas, valid values, and join rules for the relevant tables:
+--------------------------------------------------
+{schemas_context}
+--------------------------------------------------
+
 
 Rules:
+- Only use the tables and columns provided above.
+- Pay close attention to the HINTS for joining tables.
+- If you need to filter by a specific status or category, strictly use the "Available options" listed in the Column Details.
+- Always use ILIKE to search to text based columns if you don't have exact values for it.
 - SQL/database tool results are the source of truth for counts, comparisons, and trends.
 - Vector search is approximate. Never use vector results to produce exact counts.
 - For mixed questions, use SQL for the number and vector search for qualitative examples/themes.
 - Today's date is {today}. Prefer date_range values when they match the user's request.
 - Be concise and explain any limitation, such as missing assignee/resolver fields.
-
-Available ticket fields:
-- status: Open, Triaged, In Progress, Resolved, Closed
-- priority: stored as tickets.suggested_priority; values Low, Medium, High, Critical
-- category: Bug, Feature, UI, Infra, Hardware
-- created_at, updated_at, user_id, app_name, environment, project_id, summary
-- text_query: case-insensitive contains search across summary, app, category, environment, and keywords
 """
+
+
+# Available ticket fields:
+# - status: Open, Triaged, In Progress, Resolved, Closed
+# - priority: stored as tickets.suggested_priority; values Low, Medium, High, Critical
+# - category: Bug, Feature, UI, Infra, Hardware
+# - created_at, updated_at, user_id, app_name, environment, project_id, summary
+# - project_id: stored as id. Name can be found in Projects table. values: Smart Electricity, Data Analysis Tool.
+# - text_query: case-insensitive contains search across summary, app, category, environment, and keywords
 
 
 class ReadOnlySQLDatabase(SQLDatabase):
@@ -217,6 +226,8 @@ class ReadOnlySQLDatabase(SQLDatabase):
 class AdminAnalyticsState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     tool_rounds: int
+    # NEW: A list of strings to hold our fully formatted table manifests
+    table_manifests: List[str]
 
 
 class TicketFilterArgs(BaseModel):
@@ -235,7 +246,9 @@ class TicketFilterArgs(BaseModel):
         default=None,
         description="Exclusive created_at end date in YYYY-MM-DD format.",
     )
-    status: Literal["Open", "Triaged", "In Progress", "Resolved", "Closed"] | None = None
+    status: Literal["Open", "Triaged", "In Progress", "Resolved", "Closed"] | None = (
+        None
+    )
     priority: Literal["Low", "Medium", "High", "Critical"] | None = None
     category: Literal["Bug", "Feature", "UI", "Infra", "Hardware"] | None = None
     user_id: str | None = None
@@ -283,7 +296,9 @@ class TicketTrendArgs(TicketFilterArgs):
 
 class SemanticTicketSearchArgs(BaseModel):
     query: str = Field(min_length=1, max_length=1_000)
-    status: Literal["Open", "Triaged", "In Progress", "Resolved", "Closed"] | None = None
+    status: Literal["Open", "Triaged", "In Progress", "Resolved", "Closed"] | None = (
+        None
+    )
     priority: Literal["Low", "Medium", "High", "Critical"] | None = None
     category: Literal["Bug", "Feature", "UI", "Infra", "Hardware"] | None = None
     project_id: int | None = None
@@ -332,14 +347,16 @@ def run_admin_analytics_question(
             config=_analytics_invoke_config(
                 run_name="admin_analytics_graph",
                 project_id=project_id,
-                recursion_limit=5,
+                recursion_limit=10,
                 tags=["analytics", "langgraph", "graph"],
                 path="graph",
             ),  # agent→tools→agent→tools→agent = 5 max
         )
         answer = _final_message_text(state.get("messages", []))
         if answer and not trace["tools"] and _requires_grounding(clean_question):
-            trace["errors"].append("Model answered a factual analytics question without tools.")
+            trace["errors"].append(
+                "Model answered a factual analytics question without tools."
+            )
             answer = ""
         if not answer:
             answer = _answer_from_trace(clean_question, trace)
@@ -348,7 +365,9 @@ def run_admin_analytics_question(
         trace["duration_ms"] = _elapsed_ms(started)
         return {"answer": answer, "trace": _public_trace(trace)}
     except Exception as exc:
-        logger.warning("Admin analytics graph failed; finalizing from trace if possible: %s", exc)
+        logger.warning(
+            "Admin analytics graph failed; finalizing from trace if possible: %s", exc
+        )
         trace["errors"].append(str(exc))
         answer = _answer_from_trace(clean_question, trace)
         if not answer:
@@ -392,7 +411,9 @@ def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
     scope = _ANALYTICS_SCOPE.get({})
     scoped_question = clean_question
     if scope.get("project_id") is not None:
-        scoped_question = f"{clean_question} [Mandatory filter: project_id = {scope['project_id']}]"
+        scoped_question = (
+            f"{clean_question} [Mandatory filter: project_id = {scope['project_id']}]"
+        )
 
     agent = _get_sql_agent()
     result = agent.invoke(
@@ -452,7 +473,9 @@ def count_tickets(
         text_query=text_query,
     )
     where_sql, params = _ticket_where_clause(filters)
-    rows = _run_sql(f"select count(*) from tickets{where_sql}", params, purpose="count_tickets")
+    rows = _run_sql(
+        f"select count(*) from tickets{where_sql}", params, purpose="count_tickets"
+    )
     parsed = _rows_from_sql_result(rows)
     count = parsed[0][0] if parsed else 0
     return _json({"count": count, "filters": filters})
@@ -536,7 +559,11 @@ def list_tickets(
     )
     where_sql, params = _ticket_where_clause(filters)
     count_rows = _rows_from_sql_result(
-        _run_sql(f"select count(*) from tickets{where_sql}", params, purpose="list_tickets_count")
+        _run_sql(
+            f"select count(*) from tickets{where_sql}",
+            params,
+            purpose="list_tickets_count",
+        )
     )
     total_count = count_rows[0][0] if count_rows else 0
     list_params = dict(params)
@@ -645,7 +672,8 @@ def semantic_ticket_search(
         results = [
             result
             for result in results
-            if str(result.metadata.get("category") or "").casefold() == category.casefold()
+            if str(result.metadata.get("category") or "").casefold()
+            == category.casefold()
         ]
     results = results[:limit]
     _record_vector_query(
@@ -763,9 +791,11 @@ def _get_admin_tools() -> list[BaseTool]:
 @lru_cache(maxsize=1)
 def _get_analytics_graph() -> Any:
     workflow = StateGraph(AdminAnalyticsState)
+    workflow.add_node("retrieve_schemas", _retrieve_schemas_node)
     workflow.add_node("agent", _analytics_agent_node)
     workflow.add_node("tools", _analytics_tools_node)
-    workflow.set_entry_point("agent")
+    workflow.set_entry_point("retrieve_schemas")
+    workflow.add_edge("retrieve_schemas", "agent")
     workflow.add_conditional_edges(
         "agent",
         _route_after_analytics_agent,
@@ -775,7 +805,28 @@ def _get_analytics_graph() -> Any:
     return workflow.compile()
 
 
+def _retrieve_schemas_node(state: AdminAnalyticsState):
+    settings = get_settings()
+    user_query = state["messages"][-1].content
+    vector_store = get_vectorstore(index_name=settings.pinecone_db_index_name)
+    embedding_model = get_embedding_model()
+
+    embedded_query = embedding_model.embed_query(user_query)
+    search_results = vector_store.similarity_search_by_vector(embedded_query, k=3)
+
+    # Extract the table names from the vector DB metadata
+    table_names = [result.metadata["table"] for result in search_results]
+
+    # Construct the file paths
+    base_dir = "db_manifests"
+    paths = [os.path.join(base_dir, f"{name}.txt") for name in table_names]
+
+    # Update state with just the paths
+    return {"table_manifests": paths}
+
+
 def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
+    # --- 1. Scoping Logic ---
     scope = _ANALYTICS_SCOPE.get({})
     scope_instruction = ""
     if scope.get("project_id") is not None:
@@ -784,7 +835,34 @@ def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
             f"ALL tool calls MUST include project_id={scope['project_id']}. "
             f"Never return data from other projects."
         )
-    prompt = ANALYTICS_GRAPH_PROMPT.replace("{today}", _today_iso()) + scope_instruction
+
+    # --- 2. JIT Manifest Loading ---
+    # Fetch paths from state instead of full strings
+    paths = state.get("table_manifests", [])
+
+    print(paths)
+
+    manifests = []
+    for path in paths:
+        try:
+            with open(path, "r") as f:
+                manifests.append(f.read())
+        except FileNotFoundError:
+            # Handle edge cases gracefully
+            logger.warning(f"Warning: Manifest not found at {path}")
+            continue
+
+    # Combine them into a single string for the prompt
+    schemas_context = "\n\n".join(manifests)
+
+    prompt = (
+        ANALYTICS_GRAPH_PROMPT.replace("{today}", _today_iso()).replace(
+            "{schemas_context}", schemas_context
+        )
+        + scope_instruction
+    )
+
+    # --- 3. LLM Invocation ---
     llm = get_chat_model().bind_tools(_get_admin_tools())
     messages = [
         SystemMessage(content=prompt),
@@ -828,14 +906,22 @@ def _analytics_tools_node(state: AdminAnalyticsState) -> dict[str, Any]:
             preview=str(content)[:700],
             output=str(content)[:4000],
         )
-        messages.append(ToolMessage(content=str(content), tool_call_id=tool_id, name=name))
+        messages.append(
+            ToolMessage(content=str(content), tool_call_id=tool_id, name=name)
+        )
     return {"messages": messages, "tool_rounds": state.get("tool_rounds", 0) + 1}
 
 
-def _route_after_analytics_agent(state: AdminAnalyticsState) -> Literal["tools", "__end__"]:
+def _route_after_analytics_agent(
+    state: AdminAnalyticsState,
+) -> Literal["tools", "__end__"]:
     last = state["messages"][-1]
     # Allow at most 2 tool rounds (handles count+list combos); most queries need only 1.
-    if isinstance(last, AIMessage) and last.tool_calls and state.get("tool_rounds", 0) < 2:
+    if (
+        isinstance(last, AIMessage)
+        and last.tool_calls
+        and state.get("tool_rounds", 0) < 2
+    ):
         return "tools"
     return "__end__"
 
@@ -851,8 +937,8 @@ def _get_sql_agent() -> Any:
         agent_type="tool-calling",
         prefix=SQL_AGENT_PREFIX.replace("{today}", _today_iso()),
         top_k=25,
-        max_iterations=5,          # was 15 — hard cap to stay within 30 s budget
-        max_execution_time=20,     # was 120 s — fail fast and surface the structured fallback
+        max_iterations=5,  # was 15 — hard cap to stay within 30 s budget
+        max_execution_time=20,  # was 120 s — fail fast and surface the structured fallback
         verbose=False,
         agent_executor_kwargs={
             "handle_parsing_errors": _PARSING_ERROR_MESSAGE,
@@ -1307,7 +1393,13 @@ def _direct_answer_from_trace(trace: dict[str, Any]) -> str:
     has_exact_data = any(
         tool.get("ok")
         and tool.get("name")
-        in {"run_read_only_sql", "count_tickets", "group_tickets", "list_tickets", "ticket_trend"}
+        in {
+            "run_read_only_sql",
+            "count_tickets",
+            "group_tickets",
+            "list_tickets",
+            "ticket_trend",
+        }
         for tool in trace.get("tools", [])
     )
     for tool in reversed(trace.get("tools", [])):
@@ -1342,7 +1434,11 @@ def _direct_answer_from_trace(trace: dict[str, Any]) -> str:
                 interval = payload.get("interval", "period")
                 parts = ", ".join(f"{row['bucket']}: {row['count']}" for row in rows)
                 return f"Ticket trend by {interval}: {parts}."
-        if name == "semantic_ticket_search" and payload.get("result_count") == 0 and not has_exact_data:
+        if (
+            name == "semantic_ticket_search"
+            and payload.get("result_count") == 0
+            and not has_exact_data
+        ):
             return "I did not find semantically similar ticket examples in the vector index."
     return ""
 
@@ -1393,7 +1489,10 @@ def _get_analytics_db() -> ReadOnlySQLDatabase:
         sample_rows_in_table_info=2,
         max_string_length=500,
     )
-    logger.info("Admin analytics ticket count: %s", db.run_no_throw("select count(*) from tickets"))
+    logger.info(
+        "Admin analytics ticket count: %s",
+        db.run_no_throw("select count(*) from tickets"),
+    )
     return db
 
 
@@ -1408,11 +1507,13 @@ def assert_read_only_sql(sql: str, *, allow_wildcard: bool = False) -> None:
     if sensitive_subject:
         raise ValueError(f"Access to {sensitive_subject.group(1)} is not allowed.")
 
-    if _RELATIVE_DATE_SQL_RE.search(normalized):
-        raise ValueError(
-            "SQLite runtime date functions are not allowed for analytics. "
-            f"Use the current date literal {_today_iso()} for relative date ranges."
-        )
+    # Temporarily disabled: allow runtime date functions (CURRENT_DATE/date('now'), etc.)
+    # while evaluating broader natural-language time handling behavior.
+    # if _RELATIVE_DATE_SQL_RE.search(normalized):
+    #     raise ValueError(
+    #         "SQLite runtime date functions are not allowed for analytics. "
+    #         f"Use the current date literal {_today_iso()} for relative date ranges."
+    #     )
 
     sql_without_literals = _strip_single_quoted_literals(normalized)
     if ";" in sql_without_literals.rstrip(";"):

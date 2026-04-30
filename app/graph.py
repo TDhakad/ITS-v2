@@ -9,18 +9,14 @@ The LLM does all reasoning. Python handles only side effects and safety.
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import re as _re
 from functools import lru_cache
 from typing import Annotated, Any, Literal, TypedDict
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
+                                     SystemMessage, ToolMessage)
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -30,32 +26,16 @@ try:
 except Exception:  # pragma: no cover
     SqliteSaver = None  # type: ignore[assignment]
 
-from app.db import (
-    SessionLocal,
-)
-from app.db import (
-    create_ticket as _db_create_ticket,
-)
-from app.db import (
-    search_tickets as _db_search_tickets,
-)
+from app.db import SessionLocal
+from app.db import create_ticket as _db_create_ticket
+from app.db import search_tickets as _db_search_tickets
 from app.guardrails import evaluate_input_safety, redact_sensitive_text
 from app.llm import get_chat_model
 from app.rag import HybridRAGPipeline, context_from_user
-from app.schemas import (
-    ChatMessage,
-    ChatTurnResult,
-    Environment,
-    MessageRole,
-    Priority,
-    ResolutionData,
-    TicketCategory,
-    TicketCreate,
-    TicketIntelligence,
-    TicketStatus,
-    UserClearance,
-    UserRole,
-)
+from app.schemas import (AgentResponse, ChatMessage, ChatTurnResult,
+                         Environment, MessageRole, Priority, ResolutionData,
+                         TicketCategory, TicketCreate, TicketIntelligence,
+                         TicketStatus, UserClearance, UserRole)
 from app.settings import get_settings
 from app.ticket_vector import search_ticket_vectors
 
@@ -116,7 +96,10 @@ _REQUEST_CTX: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Contex
 )
 
 
+
+
 # ── Graph state ────────────────────────────────────────────────────────────────
+
 
 class HelpdeskAgentState(TypedDict, total=False):
     # LangChain messages — accumulated across turns via the checkpointer.
@@ -166,6 +149,7 @@ def _shorten_tool_text(value: str, *, max_chars: int) -> str:
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
+
 
 @tool
 def search_knowledge_base(query: str) -> str:
@@ -382,31 +366,85 @@ def create_helpdesk_ticket(
         return "Failed to create ticket."
 
 
+@tool
+def render_chart(
+    chart_type: Literal["line", "bar"],
+    title: str,
+    x_axis_key: str,
+    data_keys: list[str],
+    data: list[dict[str, Any]],
+    colors: list[str] | None = None,
+) -> str:
+    """Render an interactive chart in the frontend.
+
+    Call this AFTER analyze_ticket_data when the result contains multi-row
+    numeric data that is better understood visually (e.g. breakdowns, trends).
+    Do NOT call this for single-number answers.
+
+    Args:
+        chart_type:  "bar" for category comparisons, "line" for time-series trends.
+        title:       Short descriptive chart title.
+        x_axis_key:  The column name to use as the X-axis label.
+        data_keys:   List of numeric column names to plot as series on the Y-axis.
+        data:        List of row objects from the analytics result,
+                     e.g. [{"bucket": "High", "count": 13}, ...]
+        colors:      Optional list of hex color strings for each series in data_keys order,
+                     e.g. ["#6366f1", "#22c55e"]. Choose colors that are visually distinct
+                     and match the semantic meaning of the data (red for critical/errors,
+                     amber for warnings, green for resolved/good, indigo for neutral).
+    """
+    ctx = _request_ctx()
+    rows = [r for r in data if isinstance(r, dict)]
+    if len(rows) < 2:
+        return "Chart skipped: data must contain at least 2 rows."
+    ctx["chart"] = {
+        "chart_type": chart_type,
+        "title": title,
+        "data": rows,
+        "x_axis_key": x_axis_key,
+        "data_keys": data_keys,
+        "colors": colors,
+    }
+    return f"Chart queued: {chart_type} chart titled '{title}' with {len(rows)} rows."
+
+
 _TOOLS: list[BaseTool] = [
     search_knowledge_base,
     analyze_ticket_data,
     search_existing_tickets,
     vector_search_tickets,
     create_helpdesk_ticket,
+    render_chart,
 ]
 _TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in _TOOLS}
 
 _SYSTEM_PROMPT = """\
 You are an IT helpdesk assistant. Help users resolve IT issues concisely and professionally.
 
-Tool guidance — pick exactly one per turn based on the user's intent:
+Tool guidance:
 - search_knowledge_base: user has an IT problem → search KB first; return actionable steps.
-- analyze_ticket_data: user asks for counts, totals, breakdowns, trends, or to list tickets. Never estimate counts from search results — always use this tool.
+- analyze_ticket_data: user asks for counts, totals, breakdowns, or trends. Never estimate — always use this tool.
 - search_existing_tickets: user asks if a ticket exists or wants a status update.
-- vector_search_tickets: user describes symptoms or impact in natural language to find similar past incidents.
-- create_helpdesk_ticket: issue needs human intervention, privileged access, hardware replacement, or the user explicitly asks. Always include impact-area tags: ui, hardware, access, infra, security, network, performance, data.
+- vector_search_tickets: user describes symptoms in natural language to find similar past incidents.
+- create_helpdesk_ticket: issue needs human intervention or the user explicitly asks. Include impact-area tags: ui, hardware, access, infra, security, network, performance, data.
+- render_chart: call this AFTER analyze_ticket_data when the result has multi-row numeric data worth visualising (breakdowns, trends). Do NOT call for single-number answers.
+
+Chart workflow:
+1. Call analyze_ticket_data to get the answer.
+2. If the result contains a list of rows with counts or numeric values (e.g. by priority, status, date), call render_chart immediately after.
+   - Use "bar" for category breakdowns, "line" for time-series.
+   - Pass the exact rows from the analytics result as the data list.
+   - Always pass a colors list matching the semantic meaning of the data:
+     e.g. critical→"#ef4444", high→"#f59e0b", medium→"#6366f1", low→"#22c55e", resolved→"#10b981"
+3. After calling render_chart, respond with ONLY a single sentence confirming what was visualised. Do NOT re-list the numbers or write a paragraph. Never draw ASCII charts or text bars.
 
 Ask follow-up questions when you need the app name, error message, or affected scope.
-When referencing existing tickets in responses, format them as markdown links using the app route: [#123](/tickets/123).
+When referencing existing tickets in responses, format them as markdown links: [#123](/tickets/123).
 If the KB has no answer, check similar past tickets before creating a new one."""
 
 
 # ── Graph nodes ────────────────────────────────────────────────────────────────
+
 
 def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
     last_human = next(
@@ -517,13 +555,16 @@ def tools_node(state: HelpdeskAgentState) -> dict[str, Any]:
                 result_content = "Tool error."
 
         results.append(
-            ToolMessage(content=str(result_content), tool_call_id=tool_id, name=tool_name)
+            ToolMessage(
+                content=str(result_content), tool_call_id=tool_id, name=tool_name
+            )
         )
 
     return {"messages": results}
 
 
 # ── Routing ────────────────────────────────────────────────────────────────────
+
 
 def _route_after_guardrail(state: HelpdeskAgentState) -> Literal["agent", "__end__"]:
     if state.get("is_blocked"):
@@ -539,6 +580,7 @@ def _route_after_agent(state: HelpdeskAgentState) -> Literal["tools", "__end__"]
 
 
 # ── Graph assembly ─────────────────────────────────────────────────────────────
+
 
 def build_helpdesk_graph(checkpointer: Any | None = None):
     workflow = StateGraph(HelpdeskAgentState)
@@ -623,6 +665,7 @@ def _chat_invoke_config(
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+
 def run_chat_turn(
     *,
     message: str,
@@ -676,11 +719,17 @@ def run_chat_turn(
     # Find the last non-tool-call AI message — that's what the user sees.
     all_messages: list[BaseMessage] = final_state.get("messages", [])
     last_ai = next(
-        (m for m in reversed(all_messages) if isinstance(m, AIMessage) and not m.tool_calls),
+        (
+            m
+            for m in reversed(all_messages)
+            if isinstance(m, AIMessage) and not m.tool_calls
+        ),
         None,
     )
     response_text = (
-        str(last_ai.content) if last_ai else "I'm unable to process your request right now."
+        str(last_ai.content)
+        if last_ai
+        else "I'm unable to process your request right now."
     )
 
     # Post-process: scrub any PII / secrets that slipped through.
@@ -689,7 +738,9 @@ def run_chat_turn(
         response_text = redacted
 
     # Determine the route label used by the API and frontend.
-    route: Literal["follow_up", "self_resolution", "ticket_created", "blocked"] = "follow_up"
+    route: Literal["follow_up", "self_resolution", "ticket_created", "blocked"] = (
+        "follow_up"
+    )
     if final_state.get("is_blocked") or final_state.get("route") == "blocked":
         route = "blocked"
     elif ctx.get("ticket_id"):
@@ -697,10 +748,24 @@ def run_chat_turn(
     elif ctx.get("kb_refs"):
         route = "self_resolution"
 
+    # If the LLM called render_chart, wrap the response with the chart config.
+    agent_response: AgentResponse | None = None
+    chart_data = ctx.get("chart")
+    if chart_data:
+        try:
+            from app.schemas import ChartConfiguration
+            agent_response = AgentResponse(
+                markdown_text=response_text,
+                chart=ChartConfiguration(**chart_data),
+            )
+        except Exception:
+            logger.warning("Failed to build AgentResponse from chart ctx", exc_info=True)
+
     return ChatTurnResult(
         thread_id=thread_id,
         response=response_text,
         route=route,
         ticket_id=ctx.get("ticket_id"),
         linked_kb_articles=ctx.get("kb_refs", []),
+        agent_response=agent_response,
     )

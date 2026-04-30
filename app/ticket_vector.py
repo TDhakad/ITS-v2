@@ -11,13 +11,9 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
-from app.rag_ingest import (
-    _coerce_clearance_level,
-    _normalize_many,
-    _normalize_term,
-    _sanitize_metadata,
-    get_vectorstore,
-)
+from app.rag_ingest import (_coerce_clearance_level, _normalize_many,
+                            _normalize_term, _sanitize_metadata,
+                            get_vectorstore)
 from app.schemas import ChatMessage, KBArticleRef, TicketRead
 from app.settings import Settings, get_settings
 
@@ -54,7 +50,9 @@ def get_ticket_vectorstore(
     return get_vectorstore(
         settings=active_settings,
         persist_directory=persist_directory,
-        index_name=index_name or collection_name or active_settings.pinecone_ticket_index_name,
+        index_name=index_name
+        or collection_name
+        or active_settings.pinecone_ticket_index_name,
         embedding=embedding,
     )
 
@@ -79,7 +77,9 @@ def index_ticket(ticket: TicketRead) -> bool:
         try:
             vectorstore.delete(ids=[document_id])
         except Exception:
-            logger.debug("Ticket vector id %s was not present before upsert", document_id)
+            logger.debug(
+                "Ticket vector id %s was not present before upsert", document_id
+            )
         vectorstore.add_documents([document], ids=[document_id])
         return True
     except Exception as exc:
@@ -163,7 +163,9 @@ def search_ticket_vectors(
         ticket_id = _int_metadata(metadata.get("ticket_id"))
         if ticket_id is None or ticket_id == exclude_ticket_id:
             continue
-        if wanted_tags and not (wanted_tags & set(_normalize_many(metadata.get("tags")))):
+        if wanted_tags and not (
+            wanted_tags & set(_normalize_many(metadata.get("tags")))
+        ):
             continue
         score = float(distance) if distance is not None else 0.0
         results.append(
@@ -202,7 +204,9 @@ def ticket_vector_result_to_api(result: TicketVectorResult) -> dict[str, Any]:
 
 def _ticket_metadata(ticket: TicketRead) -> dict[str, str | int | float | bool]:
     keywords = ", ".join(ticket.intelligence.keywords)
-    kb_ids = ", ".join(article.kb_id for article in ticket.resolution.linked_kb_articles)
+    kb_ids = ", ".join(
+        article.kb_id for article in ticket.resolution.linked_kb_articles
+    )
     duplicate_ids = ", ".join(
         str(ticket_id) for ticket_id in ticket.resolution.duplicate_ticket_ids
     )
@@ -260,13 +264,17 @@ def _ticket_content(ticket: TicketRead) -> str:
     if ticket.tag_slugs:
         parts.append(f"Tags: {', '.join(ticket.tag_slugs)}")
     if ticket.resolution.linked_kb_articles:
-        parts.append(f"Linked KB: {_linked_kb_text(ticket.resolution.linked_kb_articles)}")
+        parts.append(
+            f"Linked KB: {_linked_kb_text(ticket.resolution.linked_kb_articles)}"
+        )
     if ticket.resolution.suggested_fixes:
         parts.append(f"Suggested fixes: {'; '.join(ticket.resolution.suggested_fixes)}")
     if ticket.raw_context:
         embedding_text = ticket.raw_context.get("embedding_text")
         if embedding_text:
-            parts.append(f"Search text: {_truncate(str(embedding_text), MAX_MESSAGE_CHARS)}")
+            parts.append(
+                f"Search text: {_truncate(str(embedding_text), MAX_MESSAGE_CHARS)}"
+            )
             return "\n".join(part for part in parts if part)
     if ticket.conversation:
         parts.append("Conversation:")
@@ -274,7 +282,9 @@ def _ticket_content(ticket: TicketRead) -> str:
     if ticket.raw_context:
         description = ticket.raw_context.get("description")
         if description:
-            parts.append(f"Original description: {_truncate(str(description), MAX_MESSAGE_CHARS)}")
+            parts.append(
+                f"Original description: {_truncate(str(description), MAX_MESSAGE_CHARS)}"
+            )
     return "\n".join(part for part in parts if part)
 
 
@@ -316,7 +326,9 @@ def _linked_kb_text(articles: list[KBArticleRef]) -> str:
 def _message_lines(messages: list[ChatMessage]) -> list[str]:
     lines: list[str] = []
     for message in messages[:MAX_INDEXED_MESSAGES]:
-        role = message.role.value if hasattr(message.role, "value") else str(message.role)
+        role = (
+            message.role.value if hasattr(message.role, "value") else str(message.role)
+        )
         lines.append(f"{role}: {_truncate(message.content, MAX_MESSAGE_CHARS)}")
     return lines
 

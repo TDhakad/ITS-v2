@@ -1274,6 +1274,34 @@ input:disabled {
   text-align: left;
 }
 
+.history-item-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.history-item-delete {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #8d8a85;
+}
+
+.history-item-delete:hover:not(:disabled) {
+  background: #262626;
+  color: #d5d3cf;
+}
+
+.history-item-delete:disabled {
+  opacity: 0.55;
+}
+
 .history-item:hover {
   background: #262626;
 }
@@ -2503,4 +2531,74 @@ button.ticket-ref-chip:hover {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ── ChatMessage ────────────────────────────────────────────────────────────── */
+
+.chat-message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: min(1100px, 92vw);
+}
+
+.chat-message--user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.chat-message--assistant {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+
+.chat-message__label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted, #667085);
+}
+
+.chat-message__bubble {
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #d9e0ea);
+  border-radius: 12px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--text, #374151);
+}
+
+.chat-message--user .chat-message__bubble {
+  background: var(--color-accent, #6366f1);
+  border-color: transparent;
+  color: #fff;
+}
+
+.chat-message__text {
+  font-size: 0.9rem;
+  line-height: 1.65;
+}
+
+.chat-message__text p { margin: 0 0 0.5em; }
+.chat-message__text p:last-child { margin-bottom: 0; }
+
+/* ── DynamicChart ───────────────────────────────────────────────────────────── */
+
+.dynamic-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-x: auto;
+}
+
+.dynamic-chart__title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted, #667085);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }

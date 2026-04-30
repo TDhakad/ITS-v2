@@ -90,18 +90,26 @@ def _create_chat_messages(connection: Connection) -> None:
             """
         )
     )
-    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_messages_id ON chat_messages (id)"))
     connection.execute(
-        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_user_id ON chat_messages (user_id)")
+        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_id ON chat_messages (id)")
     )
     connection.execute(
-        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_thread_id ON chat_messages (thread_id)")
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_chat_messages_user_id ON chat_messages (user_id)"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_chat_messages_thread_id ON chat_messages (thread_id)"
+        )
     )
     connection.execute(
         text("CREATE INDEX IF NOT EXISTS ix_chat_messages_role ON chat_messages (role)")
     )
     connection.execute(
-        text("CREATE INDEX IF NOT EXISTS ix_chat_messages_created_at ON chat_messages (created_at)")
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_chat_messages_created_at ON chat_messages (created_at)"
+        )
     )
 
 
@@ -112,9 +120,18 @@ def _drop_deprecated_ticket_link_tables(connection: Connection) -> None:
     connection.execute(text("DROP TABLE IF EXISTS duplicate_ticket_links"))
 
 
+def _add_agent_response_to_chat_messages(connection: Connection) -> None:
+    connection.execute(
+        text(
+            "ALTER TABLE chat_messages ADD COLUMN agent_response TEXT"
+        )
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     ("0001_initial_schema", _initial_schema),
     ("0002_backfill_ticket_messages", _backfill_ticket_messages),
     ("0003_create_chat_messages", _create_chat_messages),
     ("0004_drop_deprecated_ticket_link_tables", _drop_deprecated_ticket_link_tables),
+    ("0005_add_agent_response_to_chat_messages", _add_agent_response_to_chat_messages),
 )

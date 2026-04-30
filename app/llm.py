@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_ollama import ChatOllama
-from app.settings import Settings, get_settings
 from langchain_huggingface import HuggingFaceEmbeddings
-from dotenv import load_dotenv
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+from app.settings import Settings, get_settings
 
 load_dotenv()
+
 
 def get_chat_model(settings: Settings | None = None) -> BaseChatModel:
     settings = settings or get_settings()
@@ -47,7 +49,9 @@ def get_embedding_model(settings: Settings | None = None) -> Embeddings:
 
     if provider == "openai":
         if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai.")
+            raise RuntimeError(
+                "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai."
+            )
         kwargs = {
             "model": settings.openai_embedding_model,
             "api_key": settings.openai_api_key,
