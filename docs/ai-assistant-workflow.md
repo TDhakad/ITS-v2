@@ -155,7 +155,7 @@ flowchart TD
     C -->|Safe| G[Assistant reasoning node]
     G --> H{Tool needed?}
     H -->|No| I[Draft final response]
-    H -->|Yes| J[Execute approved tools]
+    H -->|Yes| J[Execute approved tool]
     J --> K[Return tool evidence to assistant]
     K --> G
 
@@ -163,9 +163,16 @@ flowchart TD
     L -->|Yes| M[Create helpdesk ticket]
     L -->|No| N[Apply output sanitation]
     M --> N
-    N --> O[Assign route outcome]
-    O --> P[Persist chat turn]
-    P --> Q[Return response to user]
+    N --> O{Chart queued via render_chart?}
+    O -->|Yes| P[Wrap response as AgentResponse\nmarkdown_text + ChartConfiguration]
+    O -->|No| Q[Plain text response]
+    P --> R[Assign route outcome]
+    Q --> R
+    R --> S[Persist chat turn\nincl. agent_response JSON]
+    S --> T[Return response to UI]
+    T --> U{Response type?}
+    U -->|AgentResponse with chart| V[Render DynamicChart\nbar or line, LLM colors]
+    U -->|Plain markdown| W[Render markdown text]
 ```
 
 ## SQL Analytics Agent Workflow
@@ -192,26 +199,29 @@ For analytics-style questions (counts, trends, groupings, operational reporting)
 
 ```mermaid
 flowchart TD
-    A[Analytics Question Received] --> B[Set Scope & Trace Context]
-    B --> C[Analytics Reasoning Node]
-    C --> D{Tool Call Needed?}
+    A[Analytics question detected\ne.g. counts / breakdowns / trends] --> B[Intent hint injected into system prompt]
+    B --> C[Agent reasoning node]
+    C --> D{Tool call?}
 
-    D -- Yes --> F[Execute Analytics Tool]
-    D -- No --> H{Answer Sufficient?}
+    D -- analyze_ticket_data --> E[Run SQL aggregation\ngroup_tickets / trend query]
+    E --> F{Result has multi-row\nnumeric data?}
 
-    F --> G[Record Output and Trace]
-    G --> H
+    F -- No --> G[Return single-value answer as markdown]
+    F -- Yes --> H[Call render_chart tool]
 
-    H -- No --> C
-    H -- Yes --> E[Prepare Answer If Grounded]
+    H --> I[Store ChartConfiguration in request context\nchart_type / title / data / x_axis_key\ndata_keys / semantic colors]
+    I --> J[Agent writes one-sentence confirmation]
+    J --> K[Build AgentResponse\nmarkdown_text + ChartConfiguration]
 
-    E --> I{Grounded and Valid?}
+    K --> L[Persist agent_response JSON\nin chat_messages table]
+    L --> M[Return to frontend]
 
-    I -- Yes --> Z[Final Answer]
-    I -- No --> K[Fallback to Guarded SQL Agent]
+    M --> N{On load / reload?}
+    N -- First load --> O[Render DynamicChart\nauto-sized: rows × px per group]
+    N -- Page reload --> P[Restore from chat history API\nagent_response field]
+    P --> O
 
-    K --> L[Summarize Verified SQL Result]
-    L --> Z 
+    D -- No tool needed --> G
 ```
 
 ## Unified Decision Logic (What users experience)
@@ -233,9 +243,13 @@ Operational outcome:
 ### C. Analytics answer path
 User experience:
 - The assistant returns exact counts/trends for report-style questions.
+- When the result contains multiple rows (breakdowns by priority, status, date, etc.), an interactive bar or line chart is rendered inline below a one-sentence summary.
+- Charts use semantically meaningful colors chosen by the LLM (e.g. red for critical, amber for high, green for resolved).
+- Charts persist across page reloads because the full chart configuration is stored alongside the message in the database.
 
 Operational outcome:
 - Answers are grounded in governed analytics tools and read-only data pathways.
+- Chart configurations are serialised as `agent_response` JSON in `chat_messages` and restored on history load.
 
 ### D. Ticket-created path
 User experience:
