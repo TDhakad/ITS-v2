@@ -13,8 +13,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.db import (SessionLocal, add_project_member, create_project,
-                    get_user_by_email, init_db, list_projects)
+from app.db import (
+    SessionLocal,
+    add_project_member,
+    create_project,
+    get_user_by_email,
+    init_db,
+    list_projects,
+)
 from app.schemas import ProjectAccessLevel, ProjectCreate
 
 MOCK_PROJECTS: list[dict[str, str]] = [

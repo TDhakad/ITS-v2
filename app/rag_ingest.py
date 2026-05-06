@@ -14,8 +14,7 @@ from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain_text_splitters import (MarkdownHeaderTextSplitter,
-                                      MarkdownTextSplitter)
+from langchain_text_splitters import MarkdownHeaderTextSplitter, MarkdownTextSplitter
 
 from app.llm import get_embedding_model
 from app.schemas import UserClearance

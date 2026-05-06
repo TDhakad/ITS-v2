@@ -2,25 +2,57 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Generator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import (Boolean, DateTime, Float, ForeignKey, Integer, String,
-                        Text, UniqueConstraint, cast, create_engine, event,
-                        or_, select)
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    and_,
+    cast,
+    create_engine,
+    event,
+    or_,
+    select,
+)
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.mutable import MutableDict, MutableList
-from sqlalchemy.orm import (DeclarativeBase, Mapped, Session, aliased,
-                            mapped_column, relationship, selectinload,
-                            sessionmaker)
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    aliased,
+    mapped_column,
+    relationship,
+    selectinload,
+    sessionmaker,
+)
 from sqlalchemy.types import JSON
 
-from app.schemas import (DEFAULT_TAG_SLUGS, TAG_COLORS, ChatMessage,
-                         Environment, GuardrailDecision, Priority,
-                         ProjectAccessLevel, ProjectCreate, ResolutionData,
-                         TicketCategory, TicketCreate, TicketIntelligence,
-                         TicketRead, TicketStatus, UserClearance, UserRole)
+from app.schemas import (
+    DEFAULT_TAG_SLUGS,
+    TAG_COLORS,
+    ChatMessage,
+    Environment,
+    GuardrailDecision,
+    Priority,
+    ProjectAccessLevel,
+    ProjectCreate,
+    ResolutionData,
+    TicketCategory,
+    TicketCreate,
+    TicketIntelligence,
+    TicketRead,
+    TicketStatus,
+    UserClearance,
+    UserRole,
+)
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -69,6 +101,11 @@ def set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
     if settings.database_url.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            logger.debug("SQLite WAL mode unavailable for this connection")
         cursor.close()
 
 
@@ -618,6 +655,11 @@ class TicketRecord(Base):
         cascade="all, delete-orphan",
         order_by="TicketMessageRecord.created_at",
     )
+    comments: Mapped[list[TicketCommentRecord]] = relationship(
+        back_populates="ticket",
+        cascade="all, delete-orphan",
+        order_by="TicketCommentRecord.created_at",
+    )
     tag_links: Mapped[list[TicketTagRecord]] = relationship(
         back_populates="ticket",
         cascade="all, delete-orphan",
@@ -663,6 +705,108 @@ class TicketMessageRecord(Base):
     ticket: Mapped[TicketRecord] = relationship(back_populates="messages")
 
 
+class TicketCommentRecord(Base):
+    """Stores user and admin comments for a ticket, including threaded replies."""
+
+    __tablename__ = "ticket_comments"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for the ticket comment row.",
+    )
+    ticket_id: Mapped[int] = mapped_column(
+        ForeignKey("tickets.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to tickets.id.",
+    )
+    author_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        comment="Author user id for this comment.",
+    )
+    parent_comment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ticket_comments.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="Optional parent comment id for threaded replies.",
+    )
+    content: Mapped[str] = mapped_column(
+        Text,
+        comment="Comment text.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        index=True,
+        comment="UTC timestamp when the comment was created.",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        comment="UTC timestamp when the comment was last updated.",
+    )
+
+    ticket: Mapped[TicketRecord] = relationship(back_populates="comments")
+    author: Mapped[UserRecord] = relationship()
+    parent: Mapped[TicketCommentRecord | None] = relationship(
+        "TicketCommentRecord",
+        remote_side="TicketCommentRecord.id",
+        back_populates="children",
+    )
+    children: Mapped[list[TicketCommentRecord]] = relationship(
+        "TicketCommentRecord",
+        back_populates="parent",
+        cascade="all, delete-orphan",
+        single_parent=True,
+        order_by="TicketCommentRecord.created_at",
+    )
+
+
+class BackgroundJobRecord(Base):
+    """Durable queue for slow external work owned by the web application."""
+
+    __tablename__ = "background_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class TicketInsightRecord(Base):
+    """Caches expensive ticket insight payloads so read endpoints stay predictable."""
+
+    __tablename__ = "ticket_insights"
+
+    ticket_id: Mapped[int] = mapped_column(
+        ForeignKey("tickets.id", ondelete="CASCADE"), primary_key=True
+    )
+    cache_key: Mapped[str] = mapped_column(String(200), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 def ensure_database_directory() -> None:
     if not settings.database_url.startswith("sqlite"):
         return
@@ -702,7 +846,6 @@ def add_chat_turn_messages(
     assistant_message: str,
     agent_response_json: str | None = None,
 ) -> None:
-    import json as _json
     now = utcnow()
     db.add_all(
         [
@@ -1027,6 +1170,208 @@ def list_tickets(
     return [_ticket_to_read(record) for record in db.scalars(stmt).unique().all()]
 
 
+def list_ticket_comments(db: Session, ticket_id: int) -> list[TicketCommentRecord]:
+    stmt = (
+        select(TicketCommentRecord)
+        .options(selectinload(TicketCommentRecord.author))
+        .where(TicketCommentRecord.ticket_id == ticket_id)
+        .order_by(TicketCommentRecord.created_at.asc(), TicketCommentRecord.id.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
+def get_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    comment_id: int,
+) -> TicketCommentRecord | None:
+    return db.scalars(
+        select(TicketCommentRecord)
+        .options(selectinload(TicketCommentRecord.author))
+        .where(
+            TicketCommentRecord.ticket_id == ticket_id,
+            TicketCommentRecord.id == comment_id,
+        )
+    ).first()
+
+
+def create_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    author_user_id: int,
+    content: str,
+    parent_comment_id: int | None = None,
+) -> TicketCommentRecord:
+    if parent_comment_id is not None:
+        parent = db.scalars(
+            select(TicketCommentRecord).where(
+                TicketCommentRecord.id == parent_comment_id,
+                TicketCommentRecord.ticket_id == ticket_id,
+            )
+        ).first()
+        if parent is None:
+            raise ValueError("Parent comment was not found for this ticket.")
+
+    record = TicketCommentRecord(
+        ticket_id=ticket_id,
+        author_user_id=author_user_id,
+        parent_comment_id=parent_comment_id,
+        content=content,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return get_ticket_comment(db, ticket_id=ticket_id, comment_id=record.id) or record
+
+
+def update_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    comment_id: int,
+    content: str,
+) -> TicketCommentRecord | None:
+    record = get_ticket_comment(db, ticket_id=ticket_id, comment_id=comment_id)
+    if record is None:
+        return None
+    record.content = content
+    record.updated_at = utcnow()
+    db.commit()
+    db.refresh(record)
+    return get_ticket_comment(db, ticket_id=ticket_id, comment_id=record.id) or record
+
+
+def delete_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    comment_id: int,
+) -> bool:
+    record = get_ticket_comment(db, ticket_id=ticket_id, comment_id=comment_id)
+    if record is None:
+        return False
+    db.delete(record)
+    db.commit()
+    return True
+
+
+def enqueue_background_job(
+    db: Session,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    run_after: datetime | None = None,
+    max_attempts: int = 5,
+) -> BackgroundJobRecord:
+    record = BackgroundJobRecord(
+        kind=kind,
+        payload=payload,
+        run_after=run_after or utcnow(),
+        max_attempts=max(1, max_attempts),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def claim_next_background_job(db: Session) -> BackgroundJobRecord | None:
+    now = utcnow()
+    stale_running_before = now - timedelta(minutes=15)
+    record = db.scalars(
+        select(BackgroundJobRecord)
+        .where(
+            or_(
+                BackgroundJobRecord.status == "pending",
+                and_(
+                    BackgroundJobRecord.status == "running",
+                    BackgroundJobRecord.updated_at <= stale_running_before,
+                ),
+            ),
+            BackgroundJobRecord.run_after <= now,
+            BackgroundJobRecord.attempts < BackgroundJobRecord.max_attempts,
+        )
+        .order_by(BackgroundJobRecord.run_after.asc(), BackgroundJobRecord.id.asc())
+        .limit(1)
+    ).first()
+    if record is None:
+        return None
+    record.status = "running"
+    record.attempts += 1
+    record.updated_at = now
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def complete_background_job(db: Session, job: BackgroundJobRecord) -> None:
+    job.status = "succeeded"
+    job.last_error = None
+    job.updated_at = utcnow()
+    db.commit()
+
+
+def fail_background_job(
+    db: Session,
+    job: BackgroundJobRecord,
+    error: str,
+    *,
+    retry_delay_seconds: int = 60,
+) -> None:
+    now = utcnow()
+    job.last_error = error[:2_000]
+    job.updated_at = now
+    if job.attempts >= job.max_attempts:
+        job.status = "failed"
+    else:
+        delay = min(max(retry_delay_seconds, 5) * max(job.attempts, 1), 900)
+        job.status = "pending"
+        job.run_after = now + timedelta(seconds=delay)
+    db.commit()
+
+
+def get_cached_ticket_insight(
+    db: Session,
+    *,
+    ticket_id: int,
+    cache_key: str,
+) -> dict[str, Any] | None:
+    record = db.get(TicketInsightRecord, ticket_id)
+    if record is None or record.cache_key != cache_key:
+        return None
+    now = utcnow()
+    expires_at = record.expires_at
+    if expires_at.tzinfo is None:
+        now = now.replace(tzinfo=None)
+    if expires_at < now:
+        return None
+    return dict(record.payload or {})
+
+
+def save_ticket_insight(
+    db: Session,
+    *,
+    ticket_id: int,
+    cache_key: str,
+    payload: dict[str, Any],
+    ttl_seconds: int = 900,
+) -> TicketInsightRecord:
+    now = utcnow()
+    record = db.get(TicketInsightRecord, ticket_id)
+    if record is None:
+        record = TicketInsightRecord(ticket_id=ticket_id, cache_key=cache_key)
+        db.add(record)
+    record.cache_key = cache_key
+    record.payload = payload
+    record.generated_at = now
+    record.expires_at = now + timedelta(seconds=max(ttl_seconds, 30))
+    db.commit()
+    db.refresh(record)
+    return record
+
+
 def search_tickets(
     db: Session,
     query: str,
@@ -1037,6 +1382,7 @@ def search_tickets(
     status: str | None = None,
     priority: str | None = None,
     limit: int = 10,
+    use_vector: bool = True,
 ) -> list[dict[str, Any]]:
     """Semantic ticket search with keyword fallback.
 
@@ -1046,14 +1392,18 @@ def search_tickets(
     if not query or not query.strip():
         return []
 
-    vector_results = _search_ticket_vectors(
-        query,
-        user_id=user_id,
-        project_id=project_id,
-        tag_slugs=tag_slugs,
-        status=status,
-        priority=priority,
-        limit=limit,
+    vector_results = (
+        _search_ticket_vectors(
+            query,
+            user_id=user_id,
+            project_id=project_id,
+            tag_slugs=tag_slugs,
+            status=status,
+            priority=priority,
+            limit=limit,
+        )
+        if use_vector
+        else []
     )
 
     tokens = [token.casefold() for token in query.split() if len(token) > 2]
@@ -1094,6 +1444,7 @@ def search_tickets(
                     "status": record.status,
                     "priority": record.suggested_priority,
                     "category": record.category,
+                    "app_name": record.app_name,
                     "user_id": record.user_id,
                     "project_id": record.project_id,
                     "tags": _tag_slugs_for_record(record),
@@ -1109,11 +1460,38 @@ def search_tickets(
     if not vector_results:
         return results[:limit]
 
-    seen = {result["ticket_id"] for result in vector_results}
-    merged = [
-        *vector_results,
-        *(result for result in results if result["ticket_id"] not in seen),
-    ]
+    merged_by_id: dict[int, dict[str, Any]] = {}
+    for result in vector_results:
+        item = dict(result)
+        item["vector_score"] = float(item.get("score") or 0.0)
+        item["keyword_score"] = 0
+        merged_by_id[int(item["ticket_id"])] = item
+
+    for result in results:
+        ticket_id = int(result["ticket_id"])
+        keyword_score = int(result.get("score") or 0)
+        existing = merged_by_id.get(ticket_id)
+        if existing is None:
+            item = dict(result)
+            item["keyword_score"] = keyword_score
+            item["vector_score"] = 0.0
+            merged_by_id[ticket_id] = item
+            continue
+
+        existing.update(result)
+        existing["source"] = "hybrid"
+        existing["keyword_score"] = keyword_score
+        existing["vector_score"] = float(existing.get("vector_score") or 0.0)
+
+    merged = list(merged_by_id.values())
+    merged.sort(
+        key=lambda item: (
+            int(item.get("keyword_score") or 0),
+            float(item.get("vector_score") or 0.0),
+            str(item.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
     return merged[:limit]
 
 
@@ -1241,8 +1619,7 @@ def _search_ticket_vectors(
         return []
 
     try:
-        from app.ticket_vector import (search_ticket_vectors,
-                                       ticket_vector_result_to_api)
+        from app.ticket_vector import search_ticket_vectors, ticket_vector_result_to_api
     except Exception as exc:
         raise TicketVectorUnavailableError(
             "Ticket vector search dependency unavailable"
@@ -1415,6 +1792,7 @@ def list_project_members(db: Session, project_id: int) -> list[ProjectMemberReco
     return list(
         db.scalars(
             select(ProjectMemberRecord)
+            .options(selectinload(ProjectMemberRecord.user))
             .where(ProjectMemberRecord.project_id == project_id)
             .order_by(ProjectMemberRecord.id)
         ).all()

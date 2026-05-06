@@ -5,15 +5,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
-from app.rag_ingest import (_coerce_clearance_level, _normalize_many,
-                            _normalize_term, _sanitize_metadata,
-                            get_vectorstore)
+from app.rag_ingest import (
+    _coerce_clearance_level,
+    _normalize_many,
+    _normalize_term,
+    _sanitize_metadata,
+    get_vectorstore,
+)
 from app.schemas import ChatMessage, KBArticleRef, TicketRead
 from app.settings import Settings, get_settings
 
@@ -47,6 +52,11 @@ def get_ticket_vectorstore(
     embedding: Embeddings | None = None,
 ):
     active_settings = settings or get_settings()
+    if settings is None and embedding is None and persist_directory is None:
+        selected_index = (
+            index_name or collection_name or active_settings.pinecone_ticket_index_name
+        )
+        return _cached_ticket_vectorstore(selected_index)
     return get_vectorstore(
         settings=active_settings,
         persist_directory=persist_directory,
@@ -55,6 +65,11 @@ def get_ticket_vectorstore(
         or active_settings.pinecone_ticket_index_name,
         embedding=embedding,
     )
+
+
+@lru_cache(maxsize=4)
+def _cached_ticket_vectorstore(index_name: str):
+    return get_vectorstore(index_name=index_name)
 
 
 def ticket_to_document(ticket: TicketRead) -> Document:
@@ -126,6 +141,7 @@ def _add_ticket_documents(vectorstore, documents: list[Document]) -> int:
 def search_ticket_vectors(
     query: str,
     *,
+    query_embedding: list[float] | None = None,
     user_id: str | None = None,
     project_id: int | None = None,
     project_ids: list[int] | None = None,
@@ -141,17 +157,25 @@ def search_ticket_vectors(
 
     try:
         vectorstore = get_ticket_vectorstore()
-        raw_results = vectorstore.similarity_search_with_score(
-            clean_query,
-            k=max(limit * 4, limit),
-            filter=_ticket_filter(
-                user_id=user_id,
-                project_id=project_id,
-                project_ids=project_ids,
-                status=status,
-                priority=priority,
-            ),
+        search_filter = _ticket_filter(
+            user_id=user_id,
+            project_id=project_id,
+            project_ids=project_ids,
+            status=status,
+            priority=priority,
         )
+        if query_embedding is None:
+            raw_results = vectorstore.similarity_search_with_score(
+                clean_query,
+                k=max(limit * 4, limit),
+                filter=search_filter,
+            )
+        else:
+            raw_results = vectorstore.similarity_search_by_vector_with_score(
+                query_embedding,
+                k=max(limit * 4, limit),
+                filter=search_filter,
+            )
     except Exception as exc:
         logger.warning("Ticket vector search unavailable: %s", exc)
         raise TicketVectorSearchUnavailable("Ticket vector search unavailable") from exc
@@ -193,6 +217,7 @@ def ticket_vector_result_to_api(result: TicketVectorResult) -> dict[str, Any]:
         "status": str(metadata.get("status") or ""),
         "priority": str(metadata.get("priority") or ""),
         "category": str(metadata.get("category") or ""),
+        "app_name": str(metadata.get("app_name") or ""),
         "user_id": str(metadata.get("user_id") or ""),
         "project_id": project_id,
         "tags": _normalize_many(metadata.get("tags")),

@@ -13,12 +13,18 @@ from langchain_community.document_compressors import FlashrankRerank
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
-from app.rag_ingest import (DEFAULT_CLEARANCE_LEVEL, DEFAULT_KB_INDEX_NAME,
-                            _clearance_label, _coerce_clearance_level,
-                            _normalize_many, _normalize_term, _stable_id,
-                            get_vectorstore, ingest_markdown_kb)
-from app.schemas import (Environment, KBArticleRef, TicketCategory,
-                         UserClearance)
+from app.rag_ingest import (
+    DEFAULT_CLEARANCE_LEVEL,
+    DEFAULT_KB_INDEX_NAME,
+    _clearance_label,
+    _coerce_clearance_level,
+    _normalize_many,
+    _normalize_term,
+    _stable_id,
+    get_vectorstore,
+    ingest_markdown_kb,
+)
+from app.schemas import Environment, KBArticleRef, TicketCategory, UserClearance
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)

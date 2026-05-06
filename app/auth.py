@@ -16,15 +16,22 @@ from __future__ import annotations
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Optional
 
 import bcrypt
 from fastapi import Cookie, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.db import (UserRecord, create_auth_session, create_user,
-                    delete_auth_session, get_auth_session, get_session,
-                    get_user_by_email, get_user_by_id, record_login)
+from app.db import (
+    SessionLocal,
+    UserRecord,
+    create_auth_session,
+    create_user,
+    delete_auth_session,
+    get_auth_session,
+    get_user_by_email,
+    get_user_by_id,
+    record_login,
+)
 from app.schemas import UserClearance, UserRead, UserRole
 
 SESSION_COOKIE = "session_token"
@@ -160,7 +167,7 @@ def admin_reset_password(db: Session, email: str, new_password: str) -> None:
 
 
 def _resolve_token(
-    request: Request, session_token: Optional[str] = Cookie(default=None)
+    request: Request, session_token: str | None = Cookie(default=None)
 ) -> str | None:
     # Also accept Bearer token in Authorization header for API clients.
     auth_header = request.headers.get("Authorization", "")
@@ -171,27 +178,26 @@ def _resolve_token(
 
 def get_optional_user(
     request: Request,
-    db: Session = Depends(get_session),
-    session_token: Optional[str] = Cookie(default=None),
+    session_token: str | None = Cookie(default=None),
 ) -> UserRead | None:
     token = _resolve_token(request, session_token)
     if not token:
         return None
-    session = get_auth_session(db, token)
-    if not session:
-        return None
-    record = get_user_by_id(db, session.user_id)
-    if not record or not record.is_active:
-        return None
-    return _record_to_read(record)
+    with SessionLocal() as db:
+        session = get_auth_session(db, token)
+        if not session:
+            return None
+        record = get_user_by_id(db, session.user_id)
+        if not record or not record.is_active:
+            return None
+        return _record_to_read(record)
 
 
 def get_current_user(
     request: Request,
-    db: Session = Depends(get_session),
-    session_token: Optional[str] = Cookie(default=None),
+    session_token: str | None = Cookie(default=None),
 ) -> UserRead:
-    user = get_optional_user(request, db, session_token)
+    user = get_optional_user(request, session_token)
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

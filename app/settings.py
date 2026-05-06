@@ -12,6 +12,20 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
+    nvidia_api_key: str | None = Field(default=None, alias="NVIDIA_API_KEY")
+    nvidia_model: str = Field(
+        default="stepfun-ai/step-3.5-flash",
+        alias="NVIDIA_MODEL",
+    )
+    nvidia_embedding_model: str = Field(
+        default="nvidia/nv-embedqa-e5-v5",
+        alias="NVIDIA_EMBEDDING_MODEL",
+    )
+    groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
+    groq_model: str = Field(
+        default="llama-3.3-70b-versatile",
+        alias="GROQ_MODEL",
+    )
     openai_embedding_model: str = Field(
         default="text-embedding-3-small",
         alias="OPENAI_EMBEDDING_MODEL",
@@ -44,6 +58,10 @@ class Settings(BaseSettings):
     pinecone_ticket_index_name: str = Field(
         default="its-tickets",
         alias="PINECONE_TICKET_INDEX_NAME",
+    )
+    pinecone_comment_index_name: str = Field(
+        default="its-comments",
+        alias="PINECONE_COMMENT_INDEX_NAME",
     )
     database_url: str = Field(
         default="sqlite:///./data/helpdesk.db", alias="DATABASE_URL"

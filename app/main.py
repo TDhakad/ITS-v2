@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import (Cookie, Depends, FastAPI, HTTPException, Query, Request,
-                     Response, status)
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               RedirectResponse)
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -19,22 +25,67 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.auth import (admin_reset_password, change_password, get_current_user,
-                      get_optional_user, login, logout, register, require_role)
+from app.auth import (
+    admin_reset_password,
+    change_password,
+    get_current_user,
+    get_optional_user,
+    login,
+    logout,
+    register,
+    require_role,
+)
 from app.db import add_chat_turn_messages, add_project_member, create_project
+from app.db import create_ticket_comment as persist_ticket_comment
 from app.db import create_ticket as persist_ticket
-from app.db import (delete_chat_thread_messages, find_recent_similar_tickets, get_project_by_id,
-                    get_session, get_ticket, get_user_by_id,
-                    get_user_project_ids, init_db, list_chat_messages,
-                    list_chat_threads, list_project_members, list_projects,
-                    list_tags, list_tickets, list_users, remove_project_member)
+from app.db import (
+    delete_chat_thread_messages,
+    delete_ticket_comment,
+    enqueue_background_job,
+    get_cached_ticket_insight,
+    get_kb_project_ids,
+    get_project_by_id,
+    get_session,
+    get_ticket,
+    get_user_by_id,
+    get_user_project_ids,
+    init_db,
+    list_chat_messages,
+    list_chat_threads,
+    list_project_members,
+    list_projects,
+    list_tags,
+    list_ticket_comments,
+    list_tickets,
+    list_users,
+    remove_project_member,
+    save_ticket_insight,
+    SessionLocal,
+    update_ticket_comment,
+)
 from app.llm import get_chat_model
-from app.schemas import (Environment, KBArticleRef, Priority,
-                         ProjectAccessLevel, ProjectCreate, ResolutionData,
-                         TicketCategory, TicketCreate, TicketIntelligence,
-                         TicketRead, TicketStatus, UserClearance, UserRead,
-                         UserRole)
+from app.schemas import (
+    Environment,
+    KBArticleRef,
+    Priority,
+    ProjectAccessLevel,
+    ProjectCreate,
+    ResolutionData,
+    TicketCategory,
+    TicketCreate,
+    TicketIntelligence,
+    TicketRead,
+    TicketStatus,
+    UserClearance,
+    UserRead,
+    UserRole,
+)
 from app.settings import get_settings
+from app.ticket_insights import (
+    INSIGHT_CACHE_TTL_SECONDS,
+    build_ticket_insights_payload,
+    ticket_insight_cache_key,
+)
 
 AdminRole = require_role(UserRole.ADMIN)
 AdminUser = Annotated[UserRead, Depends(AdminRole)]
@@ -130,6 +181,15 @@ class TicketCreateRequest(BaseModel):
     priority: Priority = Priority.MEDIUM
     keywords: list[str] = Field(default_factory=list, max_length=12)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TicketCommentCreateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=4_000)
+    parent_comment_id: int | None = Field(default=None, ge=1)
+
+
+class TicketCommentUpdateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=4_000)
 
 
 @app.on_event("startup")
@@ -293,121 +353,88 @@ def delete_chat_thread(
 def chat_turn(
     payload: ChatRequest,
     request: Request,
-    db: DBSession,
     current_user: CurrentUser,
 ) -> dict[str, Any]:
+    del request
+    return _execute_chat_turn_payload(payload=payload, current_user=current_user)
+
+
+@app.post("/api/chat/stream")
+async def chat_turn_stream(
+    payload: ChatRequest,
+    request: Request,
+    current_user: CurrentUser,
+) -> StreamingResponse:
+    del request
     _ensure_db()
     resolved_user_id = str(current_user.id)
-    resolved_clearance = current_user.clearance
     thread_id = _resolve_chat_thread_id(
         resolved_user_id,
         payload.thread_id or payload.conversation_id,
     )
-    # Resolve project: auto-detect from the user's memberships for non-admin users
-    # so the agent is always scoped to the correct project.
-    resolved_project_id = payload.project_id
-    resolved_project_ids: list[int] | None = None
-    if current_user.role != UserRole.ADMIN:
-        user_project_ids = get_user_project_ids(db, current_user.id)
-        if not user_project_ids:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="No project access assigned to this user.",
-            )
-        resolved_project_ids = user_project_ids
-        if payload.project_id and payload.project_id not in user_project_ids:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to the requested project.",
-            )
-        if payload.project_id and payload.project_id in user_project_ids:
-            resolved_project_id = payload.project_id
-        else:
-            resolved_project_id = user_project_ids[0]
-    try:
-        graph = importlib.import_module("app.graph")
-        runner = (
-            getattr(graph, "run_chat_turn", None)
-            or getattr(graph, "chat_turn", None)
-            or getattr(graph, "invoke_triage", None)
+
+    async def event_stream():
+        yield _sse_event(
+            "start",
+            {
+                "conversation_id": thread_id,
+                "thread_id": thread_id,
+            },
         )
-        if runner is None:
-            raise RuntimeError(
-                "app.graph does not expose run_chat_turn, chat_turn, or invoke_triage"
-            )
 
-        if getattr(runner, "__name__", "") == "invoke_triage":
-            result = runner(payload.message, thread_id=thread_id)
-        else:
-            result = runner(
-                thread_id=thread_id,
-                user_id=resolved_user_id,
-                message=payload.message,
-                app_name=payload.app_name,
-                environment=payload.environment,
-                clearance=resolved_clearance,
-                project_id=resolved_project_id,
-                project_ids=resolved_project_ids,
-                display_name=current_user.display_name if current_user else "User",
-                user_role=current_user.role.value if current_user else "user",
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _execute_chat_turn_payload,
+                payload=payload,
+                current_user=current_user,
             )
-    except Exception as exc:
-        logger.exception("Chat backend unavailable")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Chat backend unavailable. Check server logs for initialization details.",
-        ) from exc
+        )
 
-    ticket_id = _result_value(result, "ticket_id")
-    ticket = _safe_get_ticket(db, ticket_id) if ticket_id else None
-    linked_refs = _result_value(result, "linked_kb_articles", []) or []
-    citations = [_kb_ref_to_api(ref) for ref in linked_refs]
-    response_text = (
-        _result_value(result, "response")
-        or _result_value(result, "answer")
-        or _result_value(result, "final_answer")
-        or ""
+        # Thinking stream temporarily disabled.
+        while not worker.done():
+            await asyncio.sleep(0.04)
+
+        try:
+            response = await worker
+        except HTTPException as exc:
+            yield _sse_event(
+                "error",
+                {
+                    "detail": str(exc.detail) or "Chat backend unavailable.",
+                    "status": exc.status_code,
+                },
+            )
+            yield _sse_event("done", {"ok": False})
+            return
+        except Exception:
+            logger.exception("Chat stream backend unavailable")
+            yield _sse_event(
+                "error",
+                {
+                    "detail": "Chat backend unavailable. Check server logs for initialization details.",
+                    "status": status.HTTP_503_SERVICE_UNAVAILABLE,
+                },
+            )
+            yield _sse_event("done", {"ok": False})
+            return
+
+        response_text = str(response.get("response") or response.get("message") or "")
+        for token in _chunk_stream_text(response_text, min_size=2, max_size=4):
+            yield _sse_event("message_token", {"token": token})
+            await asyncio.sleep(0.015)
+
+        yield _sse_event("final", response)
+        yield _sse_event("done", {"ok": True})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
-    response: dict[str, Any] = {
-        "conversation_id": _result_value(result, "thread_id", thread_id),
-        "thread_id": _result_value(result, "thread_id", thread_id),
-        "message": response_text,
-        "response": response_text,
-        "route": _result_value(result, "route"),
-        "ticket_id": ticket_id,
-        "citations": citations,
-        "references": citations,
-    }
-    if ticket:
-        response["ticket"] = ticket_to_api(ticket)
-    agent_resp = _result_value(result, "agent_response")
-    if agent_resp is not None:
-        response["agent_response"] = (
-            agent_resp.model_dump(mode="json")
-            if hasattr(agent_resp, "model_dump")
-            else agent_resp
-        )
-    try:
-        _agent_resp_json: str | None = None
-        if agent_resp is not None:
-            import json as _json
-            _agent_resp_json = _json.dumps(
-                agent_resp.model_dump(mode="json")
-                if hasattr(agent_resp, "model_dump")
-                else agent_resp
-            )
-        add_chat_turn_messages(
-            db,
-            user_id=resolved_user_id,
-            thread_id=thread_id,
-            user_message=payload.message,
-            assistant_message=response_text,
-            agent_response_json=_agent_resp_json,
-        )
-    except SQLAlchemyError:
-        db.rollback()
-        logger.exception("Could not persist chat history for thread %s", thread_id)
-    return response
 
 
 @app.post("/api/tickets", status_code=status.HTTP_201_CREATED)
@@ -458,6 +485,17 @@ def create_ticket(
                     "metadata": payload.metadata,
                 },
             ),
+            index_vector=False,
+        )
+        enqueue_background_job(
+            db,
+            "ticket_vector_upsert",
+            {"ticket_id": ticket.id},
+        )
+        enqueue_background_job(
+            db,
+            "ticket_insights_refresh",
+            {"ticket_id": ticket.id},
         )
         return {"ticket": ticket_to_api(ticket, include_conversation=True)}
     except Exception as exc:
@@ -519,10 +557,10 @@ def tickets(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Ticket listing unavailable.",
         ) from exc
+    project_names = _project_name_map(db)
     return {
         "tickets": [
-            ticket_to_api(ticket, project_names=_project_name_map(db))
-            for ticket in found
+            ticket_to_api(ticket, project_names=project_names) for ticket in found
         ]
     }
 
@@ -543,6 +581,193 @@ def ticket_detail(
     )
 
 
+@app.get("/api/tickets/{ticket_id}/comments")
+def ticket_comments(
+    ticket_id: int,
+    db: DBSession,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    ticket = _safe_get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+    _assert_ticket_access(db, current_user, ticket)
+    comments = list_ticket_comments(db, ticket_id)
+    return {"comments": [_comment_to_api(comment) for comment in comments]}
+
+
+@app.post("/api/tickets/{ticket_id}/comments", status_code=status.HTTP_201_CREATED)
+def create_ticket_comment(
+    ticket_id: int,
+    payload: TicketCommentCreateRequest,
+    db: DBSession,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    ticket = _safe_get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+    _assert_ticket_access(db, current_user, ticket)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Comment content cannot be empty.",
+        )
+
+    try:
+        comment = persist_ticket_comment(
+            db,
+            ticket_id=ticket_id,
+            author_user_id=current_user.id,
+            content=content,
+            parent_comment_id=payload.parent_comment_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Ticket comment creation failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket comments unavailable.",
+        ) from exc
+
+    enqueue_background_job(
+        db,
+        "comment_vector_upsert",
+        {"ticket_id": ticket_id, "comment_id": comment.id},
+    )
+    enqueue_background_job(
+        db,
+        "ticket_insights_refresh",
+        {"ticket_id": ticket_id},
+    )
+
+    return {"comment": _comment_to_api(comment)}
+
+
+@app.patch("/api/tickets/{ticket_id}/comments/{comment_id}")
+def edit_ticket_comment(
+    ticket_id: int,
+    comment_id: int,
+    payload: TicketCommentUpdateRequest,
+    db: DBSession,
+    _: AdminUser,
+) -> dict[str, Any]:
+    _ensure_db()
+    ticket = _safe_get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Comment content cannot be empty.",
+        )
+
+    try:
+        comment = update_ticket_comment(
+            db,
+            ticket_id=ticket_id,
+            comment_id=comment_id,
+            content=content,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Ticket comment update failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket comments unavailable.",
+        ) from exc
+
+    if comment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Comment not found",
+        )
+
+    enqueue_background_job(
+        db,
+        "comment_vector_upsert",
+        {"ticket_id": ticket_id, "comment_id": comment.id},
+    )
+    enqueue_background_job(
+        db,
+        "ticket_insights_refresh",
+        {"ticket_id": ticket_id},
+    )
+    return {"comment": _comment_to_api(comment)}
+
+
+@app.delete(
+    "/api/tickets/{ticket_id}/comments/{comment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_ticket_comment(
+    ticket_id: int,
+    comment_id: int,
+    db: DBSession,
+    _: AdminUser,
+) -> Response:
+    _ensure_db()
+    ticket = _safe_get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+
+    existing_comments = list_ticket_comments(db, ticket_id)
+    comment_ids_to_delete = _comment_subtree_ids(existing_comments, comment_id)
+
+    try:
+        removed = delete_ticket_comment(
+            db,
+            ticket_id=ticket_id,
+            comment_id=comment_id,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Ticket comment delete failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket comments unavailable.",
+        ) from exc
+
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Comment not found",
+        )
+
+    if comment_ids_to_delete:
+        enqueue_background_job(
+            db,
+            "comment_vector_delete",
+            {"ticket_id": ticket_id, "comment_ids": comment_ids_to_delete},
+        )
+        enqueue_background_job(
+            db,
+            "ticket_insights_refresh",
+            {"ticket_id": ticket_id},
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @app.get("/api/tickets/{ticket_id}/insights")
 def ticket_insights(
     ticket_id: int, db: DBSession, current_user: CurrentUser
@@ -555,74 +780,20 @@ def ticket_insights(
         )
     _assert_ticket_access(db, current_user, ticket)
 
-    similar_tickets = find_recent_similar_tickets(
-        ticket.intelligence.summary,
-        exclude_ticket_id=ticket.id,
-        project_id=ticket.project_id,
-        limit=20,
+    cache_key = ticket_insight_cache_key(ticket)
+    cached = get_cached_ticket_insight(db, ticket_id=ticket.id, cache_key=cache_key)
+    if cached is not None:
+        return cached
+
+    payload = build_ticket_insights_payload(ticket)
+    save_ticket_insight(
+        db,
+        ticket_id=ticket.id,
+        cache_key=cache_key,
+        payload=payload,
+        ttl_seconds=INSIGHT_CACHE_TTL_SECONDS,
     )
-    duplicates = sorted(
-        similar_tickets,
-        key=lambda item: float(item.get("score") or 0.0),
-        reverse=True,
-    )[:10]
-    recent_related = similar_tickets[:10]
-    kb_refs: list[KBArticleRef] = []
-    retrieval_available = True
-
-    try:
-        rag_module = importlib.import_module("app.rag")
-        rag_class = rag_module.HybridRAGPipeline
-        context_factory = rag_module.context_from_user
-        rag = rag_class()
-        context = context_factory(
-            category=ticket.intelligence.category,
-            app_name=ticket.app_name,
-            environment=ticket.environment,
-            clearance=UserClearance.INTERNAL,
-        )
-        docs = rag.retrieve(ticket.intelligence.summary, context, k=5)
-        kb_refs = rag.article_refs(docs)
-    except Exception:
-        logger.exception("Ticket insight knowledge retrieval failed")
-        retrieval_available = False
-        docs = []
-
-    recommended_action, suggested_actions = _generate_recommended_actions(
-        ticket,
-        kb_refs,
-        duplicates,
-        recent_related,
-    )
-
-    citations = [_kb_ref_to_api(ref) for ref in kb_refs]
-    return {
-        "ticket_id": ticket.id,
-        "summary": ticket.intelligence.summary,
-        "recommended_action": recommended_action,
-        "suggested_priority": ticket.intelligence.suggested_priority.value,
-        "signals": [
-            ticket.intelligence.category.value,
-            *ticket.intelligence.keywords[:6],
-            *(f"duplicate #{duplicate['ticket_id']}" for duplicate in duplicates[:3]),
-        ],
-        "citations": citations,
-        "references": citations,
-        "duplicates": duplicates,
-        "recent_tickets": [
-            {
-                "ticket_id": item.get("ticket_id"),
-                "summary": item.get("summary"),
-                "status": item.get("status"),
-                "priority": item.get("priority"),
-                "created_at": item.get("created_at"),
-            }
-            for item in recent_related
-        ],
-        "suggested_fixes": suggested_actions,
-        "retrieved_chunks": len(docs),
-        "retrieval_available": retrieval_available,
-    }
+    return payload
 
 
 @app.get("/api/admin/insights")
@@ -932,6 +1103,7 @@ def get_tags(db: DBSession) -> dict[str, Any]:
 @app.get("/api/kb/doc")
 def get_kb_doc(
     current_user: CurrentUser,
+    db: DBSession,
     source: str | None = Query(default=None, max_length=500),
     kb_id: str | None = Query(default=None, max_length=200),
 ) -> FileResponse:
@@ -948,6 +1120,14 @@ def get_kb_doc(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to access this knowledge article.",
         )
+    linked_project_ids = _kb_doc_project_ids(db, resolved, kb_id)
+    if linked_project_ids and current_user.role != UserRole.ADMIN:
+        allowed_project_ids = set(get_user_project_ids(db, current_user.id))
+        if not (linked_project_ids & allowed_project_ids):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to access this knowledge article.",
+            )
 
     return FileResponse(
         path=resolved, media_type="text/markdown", filename=resolved.name
@@ -966,6 +1146,172 @@ def frontend_fallback(frontend_path: str, current_user: OptionalUser) -> Respons
     if not FRONTEND_INDEX.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     return FileResponse(FRONTEND_INDEX)
+
+
+def _execute_chat_turn_payload(
+    *,
+    payload: ChatRequest,
+    current_user: UserRead,
+) -> dict[str, Any]:
+    _ensure_db()
+    resolved_user_id = str(current_user.id)
+    resolved_clearance = current_user.clearance
+    thread_id = _resolve_chat_thread_id(
+        resolved_user_id,
+        payload.thread_id or payload.conversation_id,
+    )
+
+    # Resolve project: auto-detect from the user's memberships for non-admin users
+    # so the agent is always scoped to the correct project.
+    resolved_project_id = payload.project_id
+    resolved_project_ids: list[int] | None = None
+    if current_user.role != UserRole.ADMIN:
+        with SessionLocal() as db:
+            user_project_ids = get_user_project_ids(db, current_user.id)
+        if not user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No project access assigned to this user.",
+            )
+        resolved_project_ids = user_project_ids
+        if payload.project_id and payload.project_id not in user_project_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to the requested project.",
+            )
+        if payload.project_id and payload.project_id in user_project_ids:
+            resolved_project_id = payload.project_id
+        else:
+            resolved_project_id = user_project_ids[0]
+
+    try:
+        graph = importlib.import_module("app.graph")
+        runner = (
+            getattr(graph, "run_chat_turn", None)
+            or getattr(graph, "chat_turn", None)
+            or getattr(graph, "invoke_triage", None)
+        )
+        if runner is None:
+            raise RuntimeError(
+                "app.graph does not expose run_chat_turn, chat_turn, or invoke_triage"
+            )
+
+        if getattr(runner, "__name__", "") == "invoke_triage":
+            result = runner(payload.message, thread_id=thread_id)
+        else:
+            result = runner(
+                thread_id=thread_id,
+                user_id=resolved_user_id,
+                message=payload.message,
+                app_name=payload.app_name,
+                environment=payload.environment,
+                clearance=resolved_clearance,
+                project_id=resolved_project_id,
+                project_ids=resolved_project_ids,
+                display_name=current_user.display_name if current_user else "User",
+                user_role=current_user.role.value if current_user else "user",
+            )
+    except Exception as exc:
+        logger.exception("Chat backend unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat backend unavailable. Check server logs for initialization details.",
+        ) from exc
+
+    ticket_id = _result_value(result, "ticket_id")
+    linked_refs = _result_value(result, "linked_kb_articles", []) or []
+    citations = [_kb_ref_to_api(ref) for ref in linked_refs]
+    response_text = (
+        _result_value(result, "response")
+        or _result_value(result, "answer")
+        or _result_value(result, "final_answer")
+        or ""
+    )
+
+    response: dict[str, Any] = {
+        "conversation_id": _result_value(result, "thread_id", thread_id),
+        "thread_id": _result_value(result, "thread_id", thread_id),
+        "message": response_text,
+        "response": response_text,
+        "route": _result_value(result, "route"),
+        "ticket_id": ticket_id,
+        "citations": citations,
+        "references": citations,
+    }
+    agent_resp = _result_value(result, "agent_response")
+    if agent_resp is not None:
+        response["agent_response"] = (
+            agent_resp.model_dump(mode="json")
+            if hasattr(agent_resp, "model_dump")
+            else agent_resp
+        )
+
+    with SessionLocal() as db:
+        ticket = _safe_get_ticket(db, ticket_id) if ticket_id else None
+        if ticket:
+            response["ticket"] = ticket_to_api(ticket)
+
+        try:
+            agent_response_json: str | None = None
+            if agent_resp is not None:
+                agent_response_json = json.dumps(
+                    agent_resp.model_dump(mode="json")
+                    if hasattr(agent_resp, "model_dump")
+                    else agent_resp
+                )
+
+            add_chat_turn_messages(
+                db,
+                user_id=resolved_user_id,
+                thread_id=thread_id,
+                user_message=payload.message,
+                assistant_message=response_text,
+                agent_response_json=agent_response_json,
+            )
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Could not persist chat history for thread %s", thread_id)
+
+    return response
+
+
+def _build_reasoning_stream_text(message: str, project_id: int | None) -> str:
+    compact = " ".join((message or "").split())
+    if len(compact) > 180:
+        compact = f"{compact[:180].rstrip()}..."
+    project_context = (
+        f"project {project_id}" if project_id is not None else "all accessible projects"
+    )
+    return (
+        "Let me think this through step by step. "
+        "I am mapping your request to ticket history, comment discussions, and knowledge references. "
+        f"You asked: {compact}. "
+        f"I will scope this to {project_context} and choose the best retrieval path before producing the final answer."
+    )
+
+
+def _chunk_stream_text(
+    value: str,
+    *,
+    min_size: int,
+    max_size: int,
+):
+    if not value:
+        return
+    chunk_size = max(min_size, 1)
+    safe_max_size = max(max_size, chunk_size)
+    index = 0
+    length = len(value)
+    toggle = False
+    while index < length:
+        current_size = safe_max_size if toggle else chunk_size
+        toggle = not toggle
+        yield value[index : index + current_size]
+        index += current_size
+
+
+def _sse_event(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=True, default=str)}\n\n"
 
 
 def _result_value(result: Any, key: str, default: Any = None) -> Any:
@@ -1055,6 +1401,35 @@ def _kb_doc_clearance_level(path: Path) -> int:
     return 0
 
 
+def _kb_doc_project_ids(db: Session, path: Path, kb_id: str | None) -> set[int]:
+    project_ids: set[int] = set()
+    for identifier in _kb_doc_identifiers(path, kb_id):
+        project_ids.update(get_kb_project_ids(db, identifier))
+    return project_ids
+
+
+def _kb_doc_identifiers(path: Path, kb_id: str | None) -> list[str]:
+    candidates = [kb_id, path.name, path.stem]
+    for root in _kb_search_roots():
+        try:
+            relative = path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        candidates.extend([relative.as_posix(), relative.stem])
+
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        normalized = text.removesuffix(".md").removesuffix(".markdown")
+        if normalized not in seen:
+            seen.add(normalized)
+            identifiers.append(normalized)
+    return identifiers
+
+
 def _clearance_level(value: Any) -> int:
     if hasattr(value, "value"):
         value = value.value
@@ -1113,6 +1488,7 @@ def _resolve_chat_thread_id(
 
 def _chat_message_to_api(message: Any) -> dict[str, Any]:
     import json as _json
+
     result: dict[str, Any] = {
         "id": str(message.id),
         "role": message.role,
@@ -1125,6 +1501,50 @@ def _chat_message_to_api(message: Any) -> dict[str, Any]:
         except Exception:
             pass
     return result
+
+
+def _comment_to_api(comment: Any) -> dict[str, Any]:
+    author = getattr(comment, "author", None)
+    author_display_name = (
+        getattr(author, "display_name", None)
+        or getattr(author, "email", None)
+        or f"User #{comment.author_user_id}"
+    )
+    author_role = getattr(author, "role", UserRole.USER.value)
+    created_at = getattr(comment, "created_at", None)
+    updated_at = getattr(comment, "updated_at", None)
+    return {
+        "id": comment.id,
+        "ticket_id": comment.ticket_id,
+        "parent_comment_id": comment.parent_comment_id,
+        "author_user_id": comment.author_user_id,
+        "author_display_name": author_display_name,
+        "author_role": author_role,
+        "content": comment.content,
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "edited": bool(created_at and updated_at and updated_at > created_at),
+    }
+
+
+def _comment_subtree_ids(comments: list[Any], root_comment_id: int) -> list[int]:
+    children_by_parent: dict[int, list[int]] = {}
+    for comment in comments:
+        parent_id = getattr(comment, "parent_comment_id", None)
+        if parent_id is None:
+            continue
+        children_by_parent.setdefault(int(parent_id), []).append(int(comment.id))
+
+    if not any(getattr(comment, "id", None) == root_comment_id for comment in comments):
+        return []
+
+    collected: list[int] = []
+    queue = [root_comment_id]
+    while queue:
+        current_id = queue.pop(0)
+        collected.append(current_id)
+        queue.extend(children_by_parent.get(current_id, []))
+    return collected
 
 
 def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:

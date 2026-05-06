@@ -163,55 +163,125 @@ export function AssistantPage({
       content: trimmed,
       createdAt: new Date().toISOString()
     };
+    const assistantMessageId = generateId("msg");
+    const assistantCreatedAt = new Date().toISOString();
 
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+        createdAt: assistantCreatedAt,
+      },
+    ]);
     setInput("");
     setState("loading");
     setError(null);
+    let streamFailed = false;
 
     try {
-      const response = await api.chat({
-        message: trimmed,
-        conversation_id: conversationId,
-        thread_id: conversationId,
-        user_id: user ? String(user.id) : "anonymous",
-        environment: "unknown",
-        clearance: user?.clearance ?? "public",
-        project_id: projectId
-      });
-
-      if (response.ticket) {
-        onTicketCreated(response.ticket);
-      }
-
-      setConversationId(response.thread_id || response.conversation_id || conversationId);
-      rememberThreadId(threadStorageKey(user), response.thread_id || response.conversation_id || conversationId);
-      setMessages((current) => [
-        ...current,
+      await api.chatStream(
         {
-          id: generateId("msg"),
-          role: "assistant",
-          content: response.response || response.message || "No response content returned.",
-          createdAt: new Date().toISOString(),
-          citations: response.citations ?? response.references,
-          ticket: response.ticket,
-          agentResponse: response.agent_response ?? null
-        }
-      ]);
-      setState("ready");
-      refreshThreads();
+          message: trimmed,
+          conversation_id: conversationId,
+          thread_id: conversationId,
+          user_id: user ? String(user.id) : "anonymous",
+          environment: "unknown",
+          clearance: user?.clearance ?? "public",
+          project_id: projectId,
+        },
+        {
+          onStart: (streamMeta) => {
+            const nextThreadId =
+              streamMeta.thread_id || streamMeta.conversation_id || conversationId;
+            setConversationId(nextThreadId);
+            rememberThreadId(threadStorageKey(user), nextThreadId);
+          },
+          // Thinking stream temporarily disabled.
+          onMessageToken: (token) => {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantMessageId
+                  ? {
+                      ...message,
+                      content: `${message.content}${token}`,
+                      isStreaming: true,
+                    }
+                  : message,
+              ),
+            );
+          },
+          onFinal: (response) => {
+            if (response.ticket) {
+              onTicketCreated(response.ticket);
+            }
+
+            const nextThreadId =
+              response.thread_id || response.conversation_id || conversationId;
+            setConversationId(nextThreadId);
+            rememberThreadId(threadStorageKey(user), nextThreadId);
+
+            setMessages((current) =>
+              current.map((message) => {
+                if (message.id !== assistantMessageId) {
+                  return message;
+                }
+                return {
+                  ...message,
+                  content:
+                    response.response
+                    || response.message
+                    || message.content
+                    || "No response content returned.",
+                  citations: response.citations ?? response.references,
+                  ticket: response.ticket,
+                  agentResponse: response.agent_response ?? null,
+                  isStreaming: false,
+                };
+              }),
+            );
+          },
+          onError: (message) => {
+            streamFailed = true;
+            setError(message);
+            setMessages((current) =>
+              current.map((entry) =>
+                entry.id === assistantMessageId
+                  ? {
+                      ...entry,
+                      content: entry.content || message,
+                      isStreaming: false,
+                    }
+                  : entry,
+              ),
+            );
+          },
+        },
+      );
+
+      if (streamFailed) {
+        setState("error");
+      } else {
+        setState("ready");
+        refreshThreads();
+      }
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Assistant request failed.";
       setError(message);
-      setMessages((current) => [
-        ...current,
-        {
-          id: generateId("msg"),
-          role: "assistant",
-          content: message,
-          createdAt: new Date().toISOString()
-        }
-      ]);
+      setMessages((current) =>
+        current.map((entry) =>
+          entry.id === assistantMessageId
+            ? {
+                ...entry,
+                content: entry.content || message,
+                isStreaming: false,
+              }
+            : entry,
+        ),
+      );
       setState("error");
     }
   }
@@ -309,6 +379,7 @@ export function AssistantPage({
                   <strong>{message.role === "user" ? (user?.display_name ?? "You") : "AI Assistant"}</strong>
                   <span>{formatTime(message.createdAt)}</span>
                 </div>
+                {/* Thinking UI temporarily disabled. */}
                 {message.agentResponse ? (
                   <AgentResponseMessage message={message.agentResponse} />
                 ) : (

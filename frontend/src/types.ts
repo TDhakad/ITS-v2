@@ -41,6 +41,19 @@ export interface ConversationMessage {
   created_at?: string;
 }
 
+export interface TicketComment {
+  id: number;
+  ticket_id: number;
+  parent_comment_id: number | null;
+  author_user_id: number;
+  author_display_name: string;
+  author_role: "user" | "agent" | "admin";
+  content: string;
+  created_at: string;
+  updated_at: string;
+  edited: boolean;
+}
+
 export interface Ticket {
   id: number;
   ticket_id: number;
@@ -151,6 +164,8 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  thinking?: string;
+  isStreaming?: boolean;
   citations?: KBReference[];
   ticket?: Ticket;
   agentResponse?: AgentResponse | null;

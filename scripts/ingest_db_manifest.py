@@ -14,6 +14,27 @@ from app.db import Base, engine
 from app.rag_ingest import get_vectorstore
 from app.settings import get_settings
 
+SCHEMA_QUERY_EXAMPLES = {
+    "tickets": (
+        "Examples: component -> tickets.app_name; title -> tickets.summary; "
+        "status -> tickets.status."
+    ),
+    "ticket_tags": (
+        "Examples: ticket tags/components require ticket_tags joined to tickets "
+        "and tags."
+    ),
+    "tags": "Examples: component label, tag name, tag slug -> tags.name or tags.slug.",
+    "users": (
+        "Examples: requester, creator, user name, email -> users joined by "
+        "tickets.user_id when compatible."
+    ),
+    "projects": "Examples: project name, team, workspace -> projects.",
+    "project_members": (
+        "Examples: project membership, team member, user project access -> "
+        "project_members."
+    ),
+}
+
 
 def extract_tables_ddl(table_names: list[str]) -> dict[str, str]:
     """
@@ -173,13 +194,14 @@ def embed_models_docstring(table_names: list[str] | None = None) -> dict[str, st
     documents: list[Document] = []
     ids: list[str] = []
     for table_name, docstring in table_doc_map.items():
+        content = schema_embedding_content(table_name, docstring)
         documents.append(
             Document(
-                page_content=docstring,
+                page_content=content,
                 metadata={
                     "table": table_name,
-                    "source": f"db_model:{table_name}",
-                    "source_type": "db_model_docstring",
+                    "source": f"db_schema:{table_name}",
+                    "source_type": "db_schema_manifest",
                 },
             )
         )
@@ -188,6 +210,22 @@ def embed_models_docstring(table_names: list[str] | None = None) -> dict[str, st
     # Upsert by stable IDs so reruns refresh the same records.
     vector_store.add_documents(documents, ids=ids)
     return table_doc_map
+
+
+def schema_embedding_content(table_name: str, docstring: str) -> str:
+    manifest_path = PROJECT_ROOT / "db_manifests" / f"{table_name}.txt"
+    manifest = manifest_path.read_text() if manifest_path.exists() else ""
+    example = SCHEMA_QUERY_EXAMPLES.get(table_name, "")
+    return "\n\n".join(
+        part
+        for part in [
+            f"Table: {table_name}",
+            docstring.strip(),
+            manifest.strip(),
+            example,
+        ]
+        if part
+    )
 
 
 def parse_args() -> argparse.Namespace:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import json
 import logging
-import os
 import re
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
@@ -16,8 +15,13 @@ from typing import Annotated, Any, List, Literal, TypedDict
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langchain_community.utilities import SQLDatabase
-from langchain_core.messages import (AIMessage, BaseMessage, HumanMessage,
-                                     SystemMessage, ToolMessage)
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -128,7 +132,14 @@ _TRACE_CTX: ContextVar[dict[str, Any] | None] = ContextVar(
     "admin_analytics_trace", default=None
 )
 # Carries optional project_id scope for non-admin users so all tool calls are restricted.
-_ANALYTICS_SCOPE: ContextVar[dict[str, Any]] = ContextVar("analytics_scope", default={})
+_ANALYTICS_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "analytics_scope",
+    default=None,
+)
+_VECTOR_QUERY_CTX: ContextVar[dict[str, Any] | None] = ContextVar(
+    "analytics_vector_query",
+    default=None,
+)
 
 # Tools that accept a project_id filter and should be auto-scoped.
 _SCOPED_TOOL_NAMES: frozenset[str] = frozenset(
@@ -195,15 +206,6 @@ Rules:
 - Today's date is {today}. Prefer date_range values when they match the user's request.
 - Be concise and explain any limitation, such as missing assignee/resolver fields.
 """
-
-
-# Available ticket fields:
-# - status: Open, Triaged, In Progress, Resolved, Closed
-# - priority: stored as tickets.suggested_priority; values Low, Medium, High, Critical
-# - category: Bug, Feature, UI, Infra, Hardware
-# - created_at, updated_at, user_id, app_name, environment, project_id, summary
-# - project_id: stored as id. Name can be found in Projects table. values: Smart Electricity, Data Analysis Tool.
-# - text_query: case-insensitive contains search across summary, app, category, environment, and keywords
 
 
 class ReadOnlySQLDatabase(SQLDatabase):
@@ -339,27 +341,43 @@ def run_admin_analytics_question(
     scope_token = _ANALYTICS_SCOPE.set(
         {"project_id": project_id} if project_id is not None else {}
     )
+    vector_token = _VECTOR_QUERY_CTX.set(
+        {"query": clean_question, "embedding": None, "key": None}
+    )
     started = perf_counter()
     try:
+        direct_answer = _try_direct_structured_answer(clean_question, project_id)
+        if direct_answer:
+            trace["path"] = "direct_structured"
+            trace["duration_ms"] = _elapsed_ms(started)
+            return {"answer": direct_answer, "trace": _public_trace(trace)}
+
         graph = _get_analytics_graph()
         state = graph.invoke(
             {"messages": [HumanMessage(content=clean_question)]},
             config=_analytics_invoke_config(
                 run_name="admin_analytics_graph",
                 project_id=project_id,
-                recursion_limit=10,
+                recursion_limit=16,
                 tags=["analytics", "langgraph", "graph"],
                 path="graph",
-            ),  # agent→tools→agent→tools→agent = 5 max
+            ),
         )
         answer = _final_message_text(state.get("messages", []))
-        if answer and not trace["tools"] and _requires_grounding(clean_question):
+        # "grounded" means the graph (or direct path) already fetched real data.
+        # Include trace["sql"] so that _run_sql calls made before graph.invoke
+        # (e.g. via _try_direct_structured_answer) are also counted.
+        grounded = bool(trace["tools"]) or bool(trace["sql"])
+        if answer and not grounded and _requires_grounding(clean_question):
             trace["errors"].append(
                 "Model answered a factual analytics question without tools."
             )
             answer = ""
         if not answer:
             answer = _answer_from_trace(clean_question, trace)
+        # Only invoke the SQL agent fallback when NO structured data was
+        # fetched at all — prevents a redundant SQL round-trip when the graph
+        # already ran a tool and got a definitive (possibly empty) result.
         if not answer:
             answer = _run_sql_agent_fallback(clean_question, trace)
         trace["duration_ms"] = _elapsed_ms(started)
@@ -377,6 +395,7 @@ def run_admin_analytics_question(
     finally:
         _TRACE_CTX.reset(token)
         _ANALYTICS_SCOPE.reset(scope_token)
+        _VECTOR_QUERY_CTX.reset(vector_token)
 
 
 def _analytics_invoke_config(
@@ -408,7 +427,7 @@ def _analytics_invoke_config(
 def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
     trace["path"] = "sql_agent_fallback"
     # Inject scope hint so the SQL agent respects the project filter.
-    scope = _ANALYTICS_SCOPE.get({})
+    scope = _ANALYTICS_SCOPE.get() or {}
     scoped_question = clean_question
     if scope.get("project_id") is not None:
         scoped_question = (
@@ -442,6 +461,240 @@ def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
             "Please try the question again or make it more specific."
         )
     return answer
+
+
+def _try_direct_structured_answer(
+    question: str,
+    project_id: int | None,
+) -> str | None:
+    lower = question.casefold()
+    lookup_text = _direct_lookup_text(question)
+    if _needs_schema_selection(lower, lookup_text):
+        return None
+
+    filters = _direct_ticket_filters(lower, project_id)
+
+    group_by = _direct_group_by(lower)
+    if group_by:
+        raw = group_tickets(group_by=group_by, **filters)
+        payload = json.loads(raw)
+        rows = payload.get("rows") or []
+        if not rows:
+            return f"No matching tickets were found for that {group_by} breakdown."
+        values = ", ".join(f"{row['bucket']}: {row['count']}" for row in rows[:8])
+        return f"Breakdown by {group_by}: {values}."
+
+    interval = _direct_trend_interval(lower)
+    if interval:
+        raw = ticket_trend(interval=interval, limit=12, **filters)
+        payload = json.loads(raw)
+        rows = list(reversed(payload.get("rows") or []))
+        if not rows:
+            return "No matching ticket trend data was found."
+        values = ", ".join(f"{row['bucket']}: {row['count']}" for row in rows[:12])
+        return f"Ticket trend by {interval}: {values}."
+
+    if _DIRECT_COUNT_RE.search(lower):
+        raw = count_tickets(**filters)
+        payload = json.loads(raw)
+        return f"There were {int(payload.get('count') or 0)} matching tickets."
+
+    if _is_direct_lookup_request(lower) and (lookup_text or len(filters) > 1):
+        list_filters = dict(filters)
+        if lookup_text:
+            list_filters["text_query"] = lookup_text
+        raw = list_tickets(limit=8, **list_filters)
+        payload = json.loads(raw)
+        rows = payload.get("rows") or []
+        total_count = int(payload.get("total_count") or 0)
+        if not rows:
+            return f"No matching tickets were found for '{lookup_text or 'that request'}'."
+        lines = [f"Found {total_count} matching ticket(s). Showing {len(rows)}:"]
+        for row in rows:
+            filed = str(row.get("created_at") or "")[:10] or "unknown"
+            app_name = str(row.get("app_name") or "").strip()
+            app_text = (
+                f"; app: {app_name}"
+                if app_name and app_name.casefold() != "general"
+                else ""
+            )
+            lines.append(
+                f"- [#{row['ticket_id']}](/tickets/{row['ticket_id']}) — "
+                f"{row['summary']} (status: {row['status']}; "
+                f"priority: {row['priority']}{app_text}; filed {filed})"
+            )
+        return "\n".join(lines)
+
+    return None
+
+
+def _needs_schema_selection(lower_question: str, lookup_text: str | None) -> bool:
+    if lookup_text and (
+        _DIRECT_COUNT_RE.search(lower_question)
+        or _direct_group_by(lower_question)
+        or _direct_trend_interval(lower_question)
+    ):
+        return True
+    return any(
+        term in lower_question
+        for term in ("requester", "creator", "user name", "requester name", "tag")
+    )
+
+
+def _direct_ticket_filters(
+    lower_question: str,
+    project_id: int | None,
+) -> dict[str, Any]:
+    filters: dict[str, Any] = {"project_id": project_id}
+    date_range = _direct_date_range(lower_question)
+    if date_range:
+        filters["date_range"] = date_range
+
+    for status_value in TicketStatus:
+        if status_value.value.casefold() in lower_question:
+            filters["status"] = status_value.value
+            break
+    if "triage" in lower_question and "status" not in filters:
+        filters["status"] = TicketStatus.TRIAGED.value
+
+    for priority in Priority:
+        if priority.value.casefold() in lower_question:
+            filters["priority"] = priority.value
+            break
+
+    for category in TicketCategory:
+        if category.value.casefold() in lower_question:
+            filters["category"] = category.value
+            break
+    return filters
+
+
+def _direct_group_by(lower_question: str) -> GroupByName | None:
+    for name in GROUP_BY_COLUMNS:
+        if f"by {name}" in lower_question or f"{name} breakdown" in lower_question:
+            return name  # type: ignore[return-value]
+    if "breakdown" in lower_question or "break down" in lower_question:
+        if "priority" in lower_question:
+            return "priority"
+        if "category" in lower_question or "type" in lower_question:
+            return "category"
+        if "project" in lower_question:
+            return "project_id"
+        return "status"
+    return None
+
+
+def _direct_trend_interval(lower_question: str) -> TrendInterval | None:
+    if not any(token in lower_question for token in ("trend", "over time", "per ")):
+        return None
+    if "month" in lower_question:
+        return "month"
+    if "week" in lower_question:
+        return "week"
+    return "day"
+
+
+def _direct_date_range(lower_question: str) -> DateRangeName | None:
+    if "yesterday" in lower_question:
+        return "yesterday"
+    if "today" in lower_question:
+        return "today"
+    if "last 7" in lower_question or "past 7" in lower_question:
+        return "last_7_days"
+    if "last 10" in lower_question or "past 10" in lower_question:
+        return "last_10_days"
+    if "last 30" in lower_question or "past 30" in lower_question:
+        return "last_30_days"
+    if "last month" in lower_question:
+        return "last_month"
+    if "this month" in lower_question:
+        return "this_month"
+    return None
+
+
+_DIRECT_COUNT_RE = re.compile(
+    r"\b(how many|count|total|number of)\b.*\btickets?\b|\btickets?\b.*\bcount\b",
+    re.IGNORECASE,
+)
+_DIRECT_LOOKUP_RE = re.compile(
+    r"\b(find|show|list|search|get|check)\b|\bstatus\b",
+    re.IGNORECASE,
+)
+_LOOKUP_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "about",
+        "any",
+        "break",
+        "breakdown",
+        "by",
+        "called",
+        "check",
+        "count",
+        "down",
+        "find",
+        "for",
+        "get",
+        "how",
+        "issue",
+        "issues",
+        "list",
+        "matching",
+        "many",
+        "named",
+        "number",
+        "of",
+        "per",
+        "search",
+        "show",
+        "status",
+        "the",
+        "ticket",
+        "tickets",
+        "title",
+        "total",
+        "trend",
+        "with",
+    }
+)
+
+
+def _is_direct_lookup_request(lower_question: str) -> bool:
+    if _DIRECT_LOOKUP_RE.search(lower_question) is None:
+        return False
+    return any(
+        term in lower_question
+        for term in ("ticket", "status", "issue", "component", "app", "service")
+    )
+
+
+def _direct_lookup_text(question: str) -> str | None:
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]*", question)
+    useful: list[str] = []
+    status_values = {
+        part
+        for status in TicketStatus
+        for part in status.value.casefold().replace("-", " ").split()
+    }
+    priority_values = {priority.value.casefold() for priority in Priority}
+    category_values = {category.value.casefold() for category in TicketCategory}
+
+    for token in tokens:
+        normalized = token.casefold()
+        if (
+            normalized in _LOOKUP_STOPWORDS
+            or normalized in status_values
+            or normalized in priority_values
+            or normalized in category_values
+            or len(normalized) <= 1
+        ):
+            continue
+        useful.append(token)
+
+    if not useful:
+        return None
+    return " ".join(useful)[:200]
 
 
 def count_tickets(
@@ -558,14 +811,6 @@ def list_tickets(
         text_query=text_query,
     )
     where_sql, params = _ticket_where_clause(filters)
-    count_rows = _rows_from_sql_result(
-        _run_sql(
-            f"select count(*) from tickets{where_sql}",
-            params,
-            purpose="list_tickets_count",
-        )
-    )
-    total_count = count_rows[0][0] if count_rows else 0
     list_params = dict(params)
     list_params["limit"] = limit
     sql = (
@@ -577,7 +822,6 @@ def list_tickets(
     return _json(
         {
             "filters": filters,
-            "total_count": total_count,
             "result_count": len(rows),
             "limit": limit,
             "rows": [
@@ -663,6 +907,7 @@ def semantic_ticket_search(
     started = perf_counter()
     results = search_ticket_vectors(
         query,
+        query_embedding=_cached_query_embedding(query),
         project_id=project_id,
         status=status,
         priority=priority,
@@ -806,28 +1051,118 @@ def _get_analytics_graph() -> Any:
 
 
 def _retrieve_schemas_node(state: AdminAnalyticsState):
+    user_query = str(state["messages"][-1].content)
+    return {"table_manifests": _semantic_schema_manifest_paths(user_query)}
+
+
+def _semantic_schema_manifest_paths(question: str) -> list[str]:
+    started = perf_counter()
+    lowered = question.casefold()
+    tables = ["tickets"]
+    scores: dict[str, float] = {}
+
+    vectorstore = _schema_vectorstore()
+    embedding = _cached_query_embedding(question)
+    for doc, score in vectorstore.similarity_search_by_vector_with_score(
+        embedding,
+        k=4,
+    ):
+        table = str((doc.metadata or {}).get("table") or "").strip()
+        if table in READ_ONLY_TABLES:
+            tables.append(table)
+            scores[table] = float(score)
+
+    for table in _required_schema_tables(lowered, selected=tables):
+        tables.append(table)
+    if (_ANALYTICS_SCOPE.get() or {}).get("project_id") is not None:
+        tables.extend(["projects", "project_members"])
+
+    selected = _dedupe_tables(tables)
+    _record_schema_selection(
+        tables=selected,
+        scores=scores,
+        duration_ms=_elapsed_ms(started),
+    )
+    return [f"db_manifests/{table}.txt" for table in selected]
+
+
+def _required_schema_tables(lowered_question: str, *, selected: list[str]) -> list[str]:
+    required: list[str] = []
+    if "ticket_tags" in selected or "tags" in selected:
+        required.extend(["ticket_tags", "tags"])
+    if "project_members" in selected or any(
+        term in lowered_question for term in ("project", "team", "member")
+    ):
+        required.extend(["projects", "project_members"])
+    if any(term in lowered_question for term in ("tag", "label", "component")):
+        required.extend(["ticket_tags", "tags"])
+    if any(term in lowered_question for term in ("user", "requester", "creator")):
+        required.append("users")
+    return required
+
+
+def _dedupe_tables(tables: list[str]) -> list[str]:
+    seen: set[str] = set()
+    return [
+        table
+        for table in tables
+        if table in READ_ONLY_TABLES and not (table in seen or seen.add(table))
+    ]
+
+
+@lru_cache(maxsize=1)
+def _schema_vectorstore():
     settings = get_settings()
-    user_query = state["messages"][-1].content
-    vector_store = get_vectorstore(index_name=settings.pinecone_db_index_name)
-    embedding_model = get_embedding_model()
+    return get_vectorstore(index_name=settings.pinecone_db_index_name)
 
-    embedded_query = embedding_model.embed_query(user_query)
-    search_results = vector_store.similarity_search_by_vector(embedded_query, k=3)
 
-    # Extract the table names from the vector DB metadata
-    table_names = [result.metadata["table"] for result in search_results]
+@lru_cache(maxsize=32)
+def _manifest_text(path: str) -> str:
+    with open(path) as file:
+        return file.read()
 
-    # Construct the file paths
-    base_dir = "db_manifests"
-    paths = [os.path.join(base_dir, f"{name}.txt") for name in table_names]
 
-    # Update state with just the paths
-    return {"table_manifests": paths}
+def _cached_query_embedding(query: str) -> list[float]:
+    clean_query = " ".join(query.split())
+    settings = get_settings()
+    key = (
+        settings.embedding_provider.casefold(),
+        _embedding_model_name(settings),
+        clean_query,
+    )
+    ctx = _VECTOR_QUERY_CTX.get()
+    if ctx and ctx.get("key") == key and ctx.get("embedding") is not None:
+        return ctx["embedding"]
+
+    started = perf_counter()
+    embedding = get_embedding_model(settings).embed_query(clean_query)
+    if ctx is not None:
+        ctx["key"] = key
+        ctx["embedding"] = embedding
+    _record_embedding(
+        provider=key[0],
+        model=key[1],
+        query=clean_query,
+        dimensions=len(embedding),
+        duration_ms=_elapsed_ms(started),
+    )
+    return embedding
+
+
+def _embedding_model_name(settings: Any) -> str:
+    provider = settings.embedding_provider.casefold()
+    if provider == "openai":
+        return settings.openai_embedding_model
+    if provider in {"huggingface", "hf"}:
+        return settings.huggingface_embedding_model
+    if provider in {"nvidia", "nvidia-endpoints", "nvidia_ai_endpoints"}:
+        return settings.nvidia_embedding_model
+    return provider
 
 
 def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
     # --- 1. Scoping Logic ---
-    scope = _ANALYTICS_SCOPE.get({})
+    scope = _ANALYTICS_SCOPE.get() or {}
     scope_instruction = ""
     if scope.get("project_id") is not None:
         scope_instruction = (
@@ -840,13 +1175,10 @@ def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
     # Fetch paths from state instead of full strings
     paths = state.get("table_manifests", [])
 
-    print(paths)
-
     manifests = []
     for path in paths:
         try:
-            with open(path, "r") as f:
-                manifests.append(f.read())
+            manifests.append(_manifest_text(path))
         except FileNotFoundError:
             # Handle edge cases gracefully
             logger.warning(f"Warning: Manifest not found at {path}")
@@ -863,7 +1195,12 @@ def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
     )
 
     # --- 3. LLM Invocation ---
-    llm = get_chat_model().bind_tools(_get_admin_tools())
+    tool_rounds = state.get("tool_rounds", 0)
+    llm = (
+        get_chat_model().bind_tools(_get_admin_tools())
+        if tool_rounds < 1
+        else get_chat_model()
+    )
     messages = [
         SystemMessage(content=prompt),
         *state.get("messages", []),
@@ -878,7 +1215,8 @@ def _analytics_tools_node(state: AdminAnalyticsState) -> dict[str, Any]:
 
     tools = {tool.name: tool for tool in _get_admin_tools()}
     messages: list[ToolMessage] = []
-    scope = _ANALYTICS_SCOPE.get({})
+    scope = _ANALYTICS_SCOPE.get() or {}
+    seen_calls: set[tuple] = set()
     for call in last.tool_calls:
         name = call["name"]
         args = dict(call.get("args") or {})
@@ -886,6 +1224,12 @@ def _analytics_tools_node(state: AdminAnalyticsState) -> dict[str, Any]:
         # the LLM omits the project_id filter despite the prompt instruction).
         if scope.get("project_id") is not None and name in _SCOPED_TOOL_NAMES:
             args["project_id"] = scope["project_id"]
+        # Deduplicate: skip identical (name, args) pairs within a single tool round.
+        call_key = (name, json.dumps(args, sort_keys=True, default=str))
+        if call_key in seen_calls:
+            logger.debug("Skipping duplicate tool call: %s", name)
+            continue
+        seen_calls.add(call_key)
         tool_id = call["id"]
         started = perf_counter()
         selected = tools.get(name)
@@ -916,11 +1260,12 @@ def _route_after_analytics_agent(
     state: AdminAnalyticsState,
 ) -> Literal["tools", "__end__"]:
     last = state["messages"][-1]
-    # Allow at most 2 tool rounds (handles count+list combos); most queries need only 1.
+    # Allow one tool round. The model can request multiple tools in that round;
+    # the next agent pass must summarize instead of starting another loop.
     if (
         isinstance(last, AIMessage)
         and last.tool_calls
-        and state.get("tool_rounds", 0) < 2
+        and state.get("tool_rounds", 0) < 1
     ):
         return "tools"
     return "__end__"
@@ -937,8 +1282,8 @@ def _get_sql_agent() -> Any:
         agent_type="tool-calling",
         prefix=SQL_AGENT_PREFIX.replace("{today}", _today_iso()),
         top_k=25,
-        max_iterations=5,  # was 15 — hard cap to stay within 30 s budget
-        max_execution_time=20,  # was 120 s — fail fast and surface the structured fallback
+        max_iterations=3,
+        max_execution_time=10,
         verbose=False,
         agent_executor_kwargs={
             "handle_parsing_errors": _PARSING_ERROR_MESSAGE,
@@ -1110,14 +1455,15 @@ def _ticket_where_clause(filters: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         clauses.append(clause)
         params[param_name] = filters[key]
     if "text_query" in filters:
-        clauses.append(
-            "("
+        text_expr = (
             "lower(coalesce(summary, '') || ' ' || coalesce(app_name, '') || ' ' || "
             "coalesce(category, '') || ' ' || coalesce(environment, '') || ' ' || "
-            "coalesce(cast(keywords as text), '')) like :text_query escape '\\'"
-            ")"
+            "coalesce(cast(keywords as text), ''))"
         )
-        params["text_query"] = _contains_pattern(str(filters["text_query"]).casefold())
+        phrase = str(filters["text_query"]).strip().casefold()
+        if phrase:
+            params["text_query_0"] = _contains_pattern(phrase)
+            clauses.append(f"{text_expr} like :text_query_0 escape '\\'")
 
     if not clauses:
         return "", params
@@ -1128,13 +1474,21 @@ def _run_sql(sql: str, params: dict[str, Any], *, purpose: str) -> str:
     started = perf_counter()
     result = _get_analytics_db().run_no_throw(sql, parameters=params)
     rows = _rows_from_sql_result(result)
+    duration = _elapsed_ms(started)
     _record_sql(
         statement=sql,
         params=params,
         purpose=purpose,
-        duration_ms=_elapsed_ms(started),
+        duration_ms=duration,
         row_count=len(rows),
         result_preview=str(result)[:700],
+    )
+    logger.info(
+        "SQL [%s] rows=%d duration=%dms | %s",
+        purpose,
+        len(rows),
+        duration,
+        _compact_sql(sql),
     )
     if str(result).casefold().startswith("error:"):
         raise ValueError(str(result))
@@ -1217,6 +1571,8 @@ def _new_trace() -> dict[str, Any]:
         "tools": [],
         "sql": [],
         "vector": [],
+        "schema": [],
+        "embeddings": [],
         "errors": [],
     }
 
@@ -1228,6 +1584,8 @@ def _public_trace(trace: dict[str, Any]) -> dict[str, Any]:
         "tools": trace.get("tools", []),
         "sql": trace.get("sql", []),
         "vector": trace.get("vector", []),
+        "schema": trace.get("schema", []),
+        "embeddings": trace.get("embeddings", []),
         "errors": trace.get("errors", []),
     }
 
@@ -1295,6 +1653,46 @@ def _record_vector_query(
             "query": query,
             "filters": _safe_trace_value(filters),
             "result_count": result_count,
+            "duration_ms": duration_ms,
+        }
+    )
+
+
+def _record_schema_selection(
+    *,
+    tables: list[str],
+    scores: dict[str, float],
+    duration_ms: int,
+) -> None:
+    trace = _TRACE_CTX.get()
+    if trace is None:
+        return
+    trace["schema"].append(
+        {
+            "tables": tables,
+            "scores": scores,
+            "duration_ms": duration_ms,
+        }
+    )
+
+
+def _record_embedding(
+    *,
+    provider: str,
+    model: str,
+    query: str,
+    dimensions: int,
+    duration_ms: int,
+) -> None:
+    trace = _TRACE_CTX.get()
+    if trace is None:
+        return
+    trace["embeddings"].append(
+        {
+            "provider": provider,
+            "model": model,
+            "query": query,
+            "dimensions": dimensions,
             "duration_ms": duration_ms,
         }
     )
@@ -1450,6 +1848,11 @@ def _elapsed_ms(started: float) -> int:
 def _contains_pattern(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+def _text_query_terms(value: str) -> list[str]:
+    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value)
+    return [term for term in terms[:8] if len(term) > 1]
 
 
 @lru_cache(maxsize=1)

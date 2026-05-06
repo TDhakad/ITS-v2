@@ -10,8 +10,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.rag import (DEFAULT_KB_DIR, KnowledgeBaseRAG,  # noqa: E402
-                     format_context, ingest_markdown_kb)
+from app.rag import (
+    DEFAULT_KB_DIR,
+    KnowledgeBaseRAG,  # noqa: E402
+    format_context,
+    ingest_markdown_kb,
+)
 from app.settings import get_settings  # noqa: E402
 
 
