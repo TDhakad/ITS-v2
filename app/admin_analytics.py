@@ -508,7 +508,9 @@ def _try_direct_structured_answer(
         rows = payload.get("rows") or []
         total_count = int(payload.get("total_count") or 0)
         if not rows:
-            return f"No matching tickets were found for '{lookup_text or 'that request'}'."
+            return (
+                f"No matching tickets were found for '{lookup_text or 'that request'}'."
+            )
         lines = [f"Found {total_count} matching ticket(s). Showing {len(rows)}:"]
         for row in rows:
             filed = str(row.get("created_at") or "")[:10] or "unknown"

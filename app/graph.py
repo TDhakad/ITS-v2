@@ -172,10 +172,7 @@ You are encouraged to chain tools when necessary. For example, use `find_tickets
 """
 
 
-
-_DIRECT_RESPONSE_TOOLS: frozenset[str] = frozenset(
-    {"create_helpdesk_ticket"}
-)
+_DIRECT_RESPONSE_TOOLS: frozenset[str] = frozenset({"create_helpdesk_ticket"})
 
 
 # ── Graph nodes ────────────────────────────────────────────────────────────────

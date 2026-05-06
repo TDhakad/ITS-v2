@@ -484,6 +484,7 @@ class TicketCommentRetrieverInput(AppModel):
             return value
         if isinstance(value, str):
             import json
+
             try:
                 parsed = json.loads(value)
                 if isinstance(parsed, dict):
