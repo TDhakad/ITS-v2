@@ -1,0 +1,25 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE auth_sessions (
+	id VARCHAR(64) NOT NULL, 
+	user_id INTEGER NOT NULL, 
+	expires_at DATETIME NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	user_agent VARCHAR(512) NOT NULL, 
+	ip_address VARCHAR(64) NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+)
+
+Column Details:
+-- id: Opaque session token used as the session primary key.
+-- user_id: Foreign key to users.id for session ownership.
+-- expires_at: UTC timestamp when the session expires.
+-- created_at: UTC timestamp when the session was created.
+-- user_agent: User-Agent captured at login time.
+-- ip_address: Client IP address captured at login time.
+
+HINTS: 
+To join 'auth_sessions' and 'users', use auth_sessions.user_id = users.id

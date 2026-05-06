@@ -72,6 +72,7 @@ class _Candidate:
     vector_rank: int | None = None
     keyword_rank: int | None = None
 
+
 class KnowledgeBaseRAG:
     """Pinecone vector retriever for KB articles."""
 
@@ -85,7 +86,9 @@ class KnowledgeBaseRAG:
         reranker: FlashrankRerank | None = None,
     ) -> None:
         self.persist_directory = Path(persist_directory) if persist_directory else None
-        self.index_name = index_name or collection_name or get_settings().pinecone_kb_index_name
+        self.index_name = (
+            index_name or collection_name or get_settings().pinecone_kb_index_name
+        )
         self.vectorstore = get_vectorstore(
             persist_directory=self.persist_directory,
             index_name=self.index_name,
@@ -190,7 +193,9 @@ class KnowledgeBaseRAG:
                 query=query,
             )
         )
-        by_key = {_document_key(candidate.document): candidate for candidate in candidates}
+        by_key = {
+            _document_key(candidate.document): candidate for candidate in candidates
+        }
         reranked = [
             by_key[_document_key(document)]
             for document in reranked_docs
@@ -224,7 +229,9 @@ class HybridRAGPipeline:
         )
         return report.chunks
 
-    def retrieve(self, query: str, context: RetrievalContext, k: int = 5) -> list[Document]:
+    def retrieve(
+        self, query: str, context: RetrievalContext, k: int = 5
+    ) -> list[Document]:
         rag = _get_kb_rag(self.settings.pinecone_kb_index_name or DEFAULT_KB_INDEX_NAME)
         return rag.retrieve_documents(query, user_context=context, k=k)
 
@@ -233,7 +240,9 @@ class HybridRAGPipeline:
         seen: set[str] = set()
         for index, doc in enumerate(docs):
             metadata = doc.metadata
-            kb_id = str(metadata.get("kb_id") or metadata.get("source_id") or f"kb-{index}")
+            kb_id = str(
+                metadata.get("kb_id") or metadata.get("source_id") or f"kb-{index}"
+            )
             if kb_id in seen:
                 continue
             seen.add(kb_id)
@@ -296,7 +305,9 @@ def build_pinecone_filter(
 
     environment = context_dict.get("environment")
     if environment and _normalize_term(environment) != "unknown":
-        clauses.append({"environment": {"$in": [_normalize_term(environment), "unknown"]}})
+        clauses.append(
+            {"environment": {"$in": [_normalize_term(environment), "unknown"]}}
+        )
 
     roles = _normalize_many(
         context_dict.get("roles")
@@ -309,7 +320,9 @@ def build_pinecone_filter(
 
     department = context_dict.get("department")
     if department:
-        clauses.append({"department": {"$in": sorted({"all", _normalize_term(department)})}})
+        clauses.append(
+            {"department": {"$in": sorted({"all", _normalize_term(department)})}}
+        )
 
     if len(clauses) == 1:
         return clauses[0]
@@ -335,7 +348,9 @@ def context_from_user(
     environment: Environment | str = Environment.UNKNOWN,
     clearance: UserClearance = UserClearance.PUBLIC,
 ) -> RetrievalContext:
-    environment_value = environment.value if hasattr(environment, "value") else str(environment)
+    environment_value = (
+        environment.value if hasattr(environment, "value") else str(environment)
+    )
     return RetrievalContext(
         category=category,
         app_name=app_name,
@@ -344,7 +359,9 @@ def context_from_user(
     )
 
 
-def format_context(results: Sequence[RetrievalResult], *, max_chars_per_chunk: int = 1400) -> str:
+def format_context(
+    results: Sequence[RetrievalResult], *, max_chars_per_chunk: int = 1400
+) -> str:
     blocks: list[str] = []
     for index, result in enumerate(results, start=1):
         metadata = result.document.metadata
@@ -365,12 +382,16 @@ def format_context(results: Sequence[RetrievalResult], *, max_chars_per_chunk: i
 
 
 def _metadata_clearance(metadata: Mapping[str, Any]) -> UserClearance:
-    value = metadata.get("clearance", metadata.get("clearance_level", UserClearance.PUBLIC.value))
+    value = metadata.get(
+        "clearance", metadata.get("clearance_level", UserClearance.PUBLIC.value)
+    )
     label = _clearance_label(_coerce_clearance_level(value))
     return UserClearance(label)
 
 
-def _context_to_dict(context: RetrievalContext | Mapping[str, Any] | Any | None) -> dict[str, Any]:
+def _context_to_dict(
+    context: RetrievalContext | Mapping[str, Any] | Any | None
+) -> dict[str, Any]:
     if context is None:
         return {}
     if isinstance(context, RetrievalContext):
@@ -384,7 +405,9 @@ def _context_to_dict(context: RetrievalContext | Mapping[str, Any] | Any | None)
         return dict(context)
     if hasattr(context, "model_dump"):
         return context.model_dump(exclude_none=True)
-    logger.debug("Unsupported context type %s; ignoring extra context fields", type(context))
+    logger.debug(
+        "Unsupported context type %s; ignoring extra context fields", type(context)
+    )
     return {}
 
 

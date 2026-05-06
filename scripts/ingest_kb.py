@@ -10,9 +10,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.rag import (  # noqa: E402
+from app.rag import (
     DEFAULT_KB_DIR,
-    KnowledgeBaseRAG,
+    KnowledgeBaseRAG,  # noqa: E402
     format_context,
     ingest_markdown_kb,
 )
@@ -32,7 +32,9 @@ def parse_args() -> argparse.Namespace:
         help="Append/upsert into the existing index instead of clearing it first.",
     )
     parser.add_argument("--smoke-query", help="Run a retrieval check after ingestion.")
-    parser.add_argument("--role", default="employee", help="Role for the optional smoke query.")
+    parser.add_argument(
+        "--role", default="employee", help="Role for the optional smoke query."
+    )
     parser.add_argument(
         "--clearance-level",
         default="public",

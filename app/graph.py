@@ -8,7 +8,6 @@ The LLM does all reasoning. Python handles only side effects and safety.
 
 from __future__ import annotations
 
-import contextvars
 import logging
 import re as _re
 from functools import lru_cache
@@ -21,7 +20,6 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -30,34 +28,29 @@ try:
 except Exception:  # pragma: no cover
     SqliteSaver = None  # type: ignore[assignment]
 
-from app.db import (
-    SessionLocal,
-)
-from app.db import (
-    create_ticket as _db_create_ticket,
-)
-from app.db import (
-    search_tickets as _db_search_tickets,
-)
+from app.db import SessionLocal
+from app.db import create_ticket as _db_create_ticket
+from app.db import enqueue_background_job
 from app.guardrails import evaluate_input_safety, redact_sensitive_text
 from app.llm import get_chat_model
-from app.rag import HybridRAGPipeline, context_from_user
 from app.schemas import (
+    AgentResponse,
     ChatMessage,
     ChatTurnResult,
     Environment,
-    MessageRole,
     Priority,
     ResolutionData,
     TicketCategory,
     TicketCreate,
     TicketIntelligence,
-    TicketStatus,
     UserClearance,
     UserRole,
 )
 from app.settings import get_settings
-from app.ticket_vector import search_ticket_vectors
+from app.tools import TOOL_MAP as _TOOL_MAP
+from app.tools import TOOLS as _TOOLS
+from app.tools import install_request_context
+from app.tools import request_context
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +72,9 @@ _KB_RE = _re.compile(
 )
 _STATUS_RE = _re.compile(
     r"\b(is there (a|an) ticket|(my|the) ticket (status|about|for)|"
-    r"already (filed|a ticket)|existing ticket|check (my )?ticket)",
+    r"already (filed|a ticket)|existing ticket|check (my )?ticket|"
+    r"(find|search|show|list|get|check)\b.*\b(status|ticket|issue)|"
+    r"\bstatus\b.*\b(ticket|issue|component|app|service))",
     _re.IGNORECASE,
 )
 _CREATE_RE = _re.compile(
@@ -89,8 +84,11 @@ _CREATE_RE = _re.compile(
 
 _INTENT_HINTS: dict[str, str] = {
     "analytics": "\n\n[INTENT: analytics] → call analyze_ticket_data immediately.",
-    "create": "\n\n[INTENT: create ticket] → gather summary/category/priority then call create_helpdesk_ticket.",
-    "status": "\n\n[INTENT: status check] → call search_existing_tickets immediately.",
+    "create": (
+        "\n\n[INTENT: create ticket] → gather summary/category/priority then call "
+        "create_helpdesk_ticket."
+    ),
+    "status": "\n\n[INTENT: status check] → call find_tickets, then retrieve_ticket_comments if the user wants an update or progress details.",
     "kb": "\n\n[INTENT: kb lookup] → call search_knowledge_base immediately.",
 }
 
@@ -107,16 +105,8 @@ def _classify_intent(message: str) -> str | None:
     return None
 
 
-# ── Per-request context ────────────────────────────────────────────────────────
-# Tool side effects (ticket_id, kb_refs) propagate back to the caller because a
-# per-request dict is installed before graph.invoke().
-_REQUEST_CTX: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "helpdesk_request",
-    default=None,
-)
-
-
 # ── Graph state ────────────────────────────────────────────────────────────────
+
 
 class HelpdeskAgentState(TypedDict, total=False):
     # LangChain messages — accumulated across turns via the checkpointer.
@@ -129,284 +119,67 @@ class HelpdeskAgentState(TypedDict, total=False):
     user_clearance: UserClearance
     # Set by guardrail_node when a request is blocked.
     is_blocked: bool
+    # Set by tools_node when a tool already returned a user-facing answer.
+    direct_response: str | None
     route: str
+    # Counts completed tool rounds to prevent infinite tool-call loops.
+    tool_rounds: int
 
 
-def _request_ctx() -> dict[str, Any]:
-    return _REQUEST_CTX.get() or {}
-
-
-def _scoped_ticket_user_id(ctx: dict[str, Any]) -> str | None:
-    try:
-        clearance = UserClearance(ctx.get("user_clearance", UserClearance.PUBLIC))
-    except ValueError:
-        clearance = UserClearance.PUBLIC
-    if clearance == UserClearance.RESTRICTED:
-        return None
-    return ctx.get("user_id")
-
-
-def _enum_value(value: str | None, enum_cls: Any) -> str | None:
-    if not value:
-        return None
-    normalized = str(value).strip().casefold().replace("-", " ").replace("_", " ")
-    for item in enum_cls:
-        item_value = str(item.value)
-        item_normalized = item_value.casefold().replace("-", " ").replace("_", " ")
-        if normalized in {item_normalized, item.name.casefold()}:
-            return item_value
-    return str(value).strip()
-
-
-def _shorten_tool_text(value: str, *, max_chars: int) -> str:
-    clean = " ".join(value.split())
-    if len(clean) <= max_chars:
-        return clean
-    return f"{clean[:max_chars].rstrip()}..."
-
-
-# ── Tools ──────────────────────────────────────────────────────────────────────
-
-@tool
-def search_knowledge_base(query: str) -> str:
-    """Search the IT helpdesk knowledge base for articles, runbooks, and how-to guides.
-
-    Use this when a user has an IT issue that might be covered by existing documentation
-    (password resets, VPN problems, software installs, common errors, etc.).
-    Always try this before creating a ticket for common issues.
-    """
-    ctx = _request_ctx()
-    try:
-        rag = HybridRAGPipeline()
-        retrieval_ctx = context_from_user(
-            category=None,
-            app_name=ctx.get("app_name"),
-            environment=ctx.get("environment", Environment.UNKNOWN),
-            clearance=ctx.get("user_clearance", UserClearance.PUBLIC),
-        )
-        docs = rag.retrieve(query, retrieval_ctx, k=5)
-        if not docs:
-            return "No relevant knowledge base articles found for this query."
-        refs = rag.article_refs(docs)
-        ctx["kb_refs"] = refs
-        blocks: list[str] = []
-        for i, doc in enumerate(docs, 1):
-            title = doc.metadata.get("title", "Article")
-            blocks.append(f"[{i}] **{title}**\n{doc.page_content[:900]}")
-        return "\n\n---\n\n".join(blocks)
-    except Exception:
-        logger.exception("Knowledge base search failed")
-        return "Knowledge base search unavailable."
-
-
-@tool
-def search_existing_tickets(query: str) -> str:
-    """Search existing helpdesk tickets by topic, app name, or description.
-
-    Use this when the user asks whether a ticket already exists for a specific issue,
-    wants to check the status of a previous request, or asks about past incidents
-    (e.g. "is there a ticket for JFrog access?", "any open ticket about VPN?").
-    """
-    ctx = _request_ctx()
-    try:
-        with SessionLocal() as db:
-            results = _db_search_tickets(
-                db,
-                query,
-                user_id=_scoped_ticket_user_id(ctx),
-                project_id=ctx.get("project_id"),
-                limit=15,
-            )
-        if not results:
-            return f"No existing tickets found matching '{query}'."
-        lines = [f"Found {len(results)} matching ticket(s):\n"]
-        for r in results:
-            lines.append(
-                f"• Ticket #{r['ticket_id']} [{r['status']} / {r['priority']}] — {r['summary']} "
-                f"(filed {r['created_at'][:10] if r['created_at'] else 'unknown'})"
-            )
-        return "\n".join(lines)
-    except Exception:
-        logger.exception("Ticket search failed")
-        return "Ticket search unavailable."
-
-
-@tool
-def analyze_ticket_data(question: str) -> str:
-    """Answer exact ticket analytics questions with read-only SQL-backed tools.
-
-    Use this for ticket counts, totals, breakdowns, trends, and bounded lists
-    (for example: "how many VPN tickets?", "break VPN tickets down by status",
-    or "show the matching VPN tickets"). Do not infer exact totals from
-    search_existing_tickets or vector_search_tickets.
-    """
-    ctx = _request_ctx()
-    try:
-        from app.admin_analytics import run_admin_analytics_question
-
-        # Scope analytics to the user's project for non-admin roles to prevent
-        # cross-project data leakage.
-        user_role = ctx.get("user_role", UserRole.USER)
-        scope_project_id = (
-            None if user_role == UserRole.ADMIN else ctx.get("project_id")
-        )
-        result = run_admin_analytics_question(question, project_id=scope_project_id)
-        return str(result.get("answer") or "No analytics answer was generated.")
-    except Exception:
-        logger.exception("Ticket analytics failed")
-        return "Ticket analytics unavailable."
-
-
-@tool
-def vector_search_tickets(
-    query: str,
-    status: str | None = None,
-    priority: str | None = None,
-    tags: str | None = None,
-) -> str:
-    """Semantic vector search over historical tickets in Pinecone.
-
-    Use this when the user describes an issue in natural language and similar
-    past tickets may contain useful context, fixes, duplicate incidents, or
-    escalation patterns. This searches ticket summaries, keywords, linked KB
-    refs, suggested fixes, and conversation text.
-
-    Optional filters:
-    - status: Open, Triaged, In Progress, Resolved, or Closed
-    - priority: Low, Medium, High, or Critical
-    - tags: comma-separated impact-area slugs, e.g. "access,infra" or "security"
-    """
-    ctx = _request_ctx()
-    # Coerce tags from a comma-separated string to a list (LLMs often pass a string).
-    tag_list: list[str] | None = (
-        [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-    )
-    try:
-        results = search_ticket_vectors(
-            query,
-            user_id=_scoped_ticket_user_id(ctx),
-            project_id=ctx.get("project_id"),
-            project_ids=ctx.get("project_ids"),
-            tag_slugs=tag_list,
-            status=_enum_value(status, TicketStatus),
-            priority=_enum_value(priority, Priority),
-            limit=15,
-        )
-        if not results:
-            return f"No semantically similar tickets found for '{query}'."
-
-        lines = [f"Found {len(results)} semantically similar ticket(s):"]
-        for index, result in enumerate(results, start=1):
-            metadata = result.metadata
-            created_at = str(metadata.get("created_at") or "")
-            filed = created_at[:10] if created_at else "unknown"
-            content = _shorten_tool_text(result.content, max_chars=700)
-            lines.append(
-                "\n".join(
-                    [
-                        (
-                            f"[{index}] Ticket #{result.ticket_id} "
-                            f"[{metadata.get('status', 'unknown')} / "
-                            f"{metadata.get('priority', 'unknown')}] "
-                            f"score={result.score:.2f}"
-                        ),
-                        f"summary: {result.summary}",
-                        f"category: {metadata.get('category', 'unknown')}; filed: {filed}",
-                        f"context: {content}",
-                    ]
-                )
-            )
-        return "\n\n".join(lines)
-    except Exception:
-        logger.exception("Ticket vector search failed")
-        return "Ticket vector search unavailable."
-
-
-@tool
-def create_helpdesk_ticket(
-    summary: str,
-    category: Literal["Bug", "Feature", "UI", "Infra", "Hardware"],
-    priority: Literal["Low", "Medium", "High", "Critical"],
-    keywords: list[str],
-    tags: list[str] | None = None,
-) -> str:
-    """Create a helpdesk ticket when the issue requires human intervention.
-
-    Use this for: access requests, hardware replacements, privilege escalations,
-    problems that cannot be solved from documentation, or when the user explicitly
-    asks to file a ticket.
-
-    tags: optional list of impact-area slugs — pick from:
-      ui, hardware, access, infra, security, network, performance, data
-    """
-    ctx = _request_ctx()
-    try:
-        conversation: list[ChatMessage] = [
-            ChatMessage(
-                role=MessageRole.USER if m.type == "human" else MessageRole.ASSISTANT,
-                content=str(m.content),
-            )
-            for m in ctx.get("messages_snapshot", [])
-            if hasattr(m, "content") and m.content and m.type in ("human", "ai")
-        ]
-        with SessionLocal() as db:
-            ticket = _db_create_ticket(
-                db,
-                TicketCreate(
-                    user_id=ctx.get("user_id", "anonymous"),
-                    thread_id=ctx.get("thread_id", "unknown"),
-                    app_name=ctx.get("app_name"),
-                    environment=ctx.get("environment", Environment.UNKNOWN),
-                    user_clearance=ctx.get("user_clearance", UserClearance.PUBLIC),
-                    project_id=ctx.get("project_id"),
-                    tag_slugs=tags or [],
-                    intelligence=TicketIntelligence(
-                        category=TicketCategory(category),
-                        suggested_priority=Priority(priority),
-                        summary=summary,
-                        keywords=keywords[:12],
-                        confidence=0.85,
-                    ),
-                    resolution=ResolutionData(),
-                    conversation=conversation,
-                ),
-            )
-        ctx["ticket_id"] = ticket.id
-        return (
-            f"Ticket #{ticket.id} created successfully. "
-            f"Category: {category}, Priority: {priority}. "
-            "The helpdesk team will review and follow up with you."
-        )
-    except Exception:
-        logger.exception("Helpdesk ticket creation failed")
-        return "Failed to create ticket."
-
-
-_TOOLS: list[BaseTool] = [
-    search_knowledge_base,
-    analyze_ticket_data,
-    search_existing_tickets,
-    vector_search_tickets,
-    create_helpdesk_ticket,
-]
-_TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in _TOOLS}
+_MAX_TOOL_ROUNDS = 4
 
 _SYSTEM_PROMPT = """\
 You are an IT helpdesk assistant. Help users resolve IT issues concisely and professionally.
 
-Tool guidance — pick exactly one per turn based on the user's intent:
-- search_knowledge_base: user has an IT problem → search KB first; return actionable steps.
-- analyze_ticket_data: user asks for counts, totals, breakdowns, trends, or to list tickets. Never estimate counts from search results — always use this tool.
-- search_existing_tickets: user asks if a ticket exists or wants a status update.
-- vector_search_tickets: user describes symptoms or impact in natural language to find similar past incidents.
-- create_helpdesk_ticket: issue needs human intervention, privileged access, hardware replacement, or the user explicitly asks. Always include impact-area tags: ui, hardware, access, infra, security, network, performance, data.
+Use more tools only if result from previous tool calls are insufficient or doesn't cover complete picture.
 
-Ask follow-up questions when you need the app name, error message, or affected scope.
-When referencing existing tickets in responses, format them as markdown links using the app route: [#123](/tickets/123).
-If the KB has no answer, check similar past tickets before creating a new one."""
+### CORE BEHAVIORS & GUARDRAILS
+- Think step-by-step. Identify the user's core intent before selecting a tool.
+- NEVER invent or guess ticket IDs, metric numbers, or root causes.
+- NEVER retry a tool with the exact same parameters if it returns "no results" or an empty list. Accept that as final result.
+- ALWAYS format ticket references as markdown links: [#123](/tickets/123).
+- IF the KB has no answer, check similar past tickets before creating a new one.
+- Ask follow-up questions when you need the app name, error message, or affected scope etc.
+
+Tool choice:
+IF the user asks "How to...", "What are the steps to...", or needs troubleshooting setup:
+THEN USE: `search_knowledge_base`
+
+IF the user asks to find an existing issue, check for duplicates, or get a high-level status by component/title:
+THEN USE: `find_tickets` (Set `include_comments=true` if they ask for progress updates).
+
+IF the user asks for exact counts, totals, breakdowns, trends, or reporting (e.g., "How many P1s today?"):
+THEN USE: `analyze_ticket_data`
+
+IF the user asks for Root Cause Analysis (RCA), blockers, dependencies, or why something happened:
+THEN USE: `retrieve_ticket_comments` (Filter by ticket_ids if already known).
+
+IF you have successfully run `analyze_ticket_data` AND the result contains multiple data points that would benefit from visual comparison (e.g., trends over time, or multiple categories/groupings):
+THEN proactively USE: `render_chart` to enhance your response, even if the user did not explicitly ask for a visual.
+- Use 'bar' for comparing categories.
+- Use 'line' for time series and trends.
+- NEVER trigger a chart for a single static number or a flat list of text.
+- Structure the chart so a viewer immediately understands the comparison. Choose how many series
+  and what x_axis represents based on what makes the data clearest, not what is easiest to query.
+- Assign colors that reflect the meaning of each series. A chart where every bar or line is the
+  same color is harder to read — use distinct, meaningful colors whenever there are multiple series.
+
+IF the user asks to file a new issue, or human intervention is definitively required:
+THEN USE: `create_helpdesk_ticket` (Tag accurately: ui, hardware, access, infra, security, network, performance, data).
+
+### TOOL CHAINING
+You are encouraged to chain tools when necessary. For example, use `find_tickets` to get a Ticket ID, then immediately use `retrieve_ticket_comments` to read the engineer discussion for that specific ID before responding to the user.
+"""
+
+
+
+_DIRECT_RESPONSE_TOOLS: frozenset[str] = frozenset(
+    {"create_helpdesk_ticket"}
+)
 
 
 # ── Graph nodes ────────────────────────────────────────────────────────────────
+
 
 def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
     last_human = next(
@@ -418,10 +191,10 @@ def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
 
     decision = evaluate_input_safety(last_human.content)
     if decision.is_safe:
-        return {"is_blocked": False}
+        return {"is_blocked": False, "direct_response": None}
 
     # Security event — auto-create a security ticket and block the request.
-    ctx = _request_ctx()
+    ctx = request_context()
     ticket_note = ""
     try:
         with SessionLocal() as db:
@@ -443,6 +216,17 @@ def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
                     resolution=ResolutionData(),
                     raw_context={"guardrail": decision.model_dump(mode="json")},
                 ),
+                index_vector=False,
+            )
+            enqueue_background_job(
+                db,
+                "ticket_vector_upsert",
+                {"ticket_id": ticket.id},
+            )
+            enqueue_background_job(
+                db,
+                "ticket_insights_refresh",
+                {"ticket_id": ticket.id},
             )
         ctx["ticket_id"] = ticket.id
         ticket_note = f" Security ticket #{ticket.id} has been filed for review."
@@ -464,7 +248,7 @@ def guardrail_node(state: HelpdeskAgentState) -> dict[str, Any]:
 
 def agent_node(state: HelpdeskAgentState) -> dict[str, Any]:
     # Snapshot messages so create_helpdesk_ticket can include the conversation.
-    ctx = _request_ctx()
+    ctx = request_context()
     ctx["messages_snapshot"] = list(state.get("messages", []))
 
     # Inject a one-line intent hint so the LLM skips tool-selection reasoning
@@ -498,9 +282,11 @@ def tools_node(state: HelpdeskAgentState) -> dict[str, Any]:
     """Execute all tool calls from the last AIMessage and return ToolMessages."""
     last = state["messages"][-1]
     if not isinstance(last, AIMessage) or not last.tool_calls:
-        return {}
+        return {"direct_response": None}
 
     results: list[ToolMessage] = []
+    direct_chunks: list[str] = []
+    response_ready = True
     for call in last.tool_calls:
         tool_name = call["name"]
         tool_args = call["args"]
@@ -509,21 +295,41 @@ def tools_node(state: HelpdeskAgentState) -> dict[str, Any]:
         selected = _TOOL_MAP.get(tool_name)
         if selected is None:
             result_content = f"Unknown tool: {tool_name}"
+            response_ready = False
         else:
             try:
                 result_content = selected.invoke(tool_args)
             except Exception:
                 logger.exception("Tool invocation failed: %s", tool_name)
                 result_content = "Tool error."
+                response_ready = False
+
+        if tool_name in _DIRECT_RESPONSE_TOOLS:
+            direct_chunks.append(str(result_content).strip())
+        else:
+            response_ready = False
 
         results.append(
-            ToolMessage(content=str(result_content), tool_call_id=tool_id, name=tool_name)
+            ToolMessage(
+                content=str(result_content), tool_call_id=tool_id, name=tool_name
+            )
         )
 
-    return {"messages": results}
+    tool_rounds = int(state.get("tool_rounds") or 0) + 1
+
+    if response_ready and direct_chunks:
+        direct_response = "\n\n".join(chunk for chunk in direct_chunks if chunk)
+        return {
+            "messages": [*results, AIMessage(content=direct_response)],
+            "direct_response": direct_response,
+            "tool_rounds": tool_rounds,
+        }
+
+    return {"messages": results, "direct_response": None, "tool_rounds": tool_rounds}
 
 
 # ── Routing ────────────────────────────────────────────────────────────────────
+
 
 def _route_after_guardrail(state: HelpdeskAgentState) -> Literal["agent", "__end__"]:
     if state.get("is_blocked"):
@@ -538,7 +344,16 @@ def _route_after_agent(state: HelpdeskAgentState) -> Literal["tools", "__end__"]
     return "__end__"
 
 
+def _route_after_tools(state: HelpdeskAgentState) -> Literal["agent", "__end__"]:
+    if state.get("direct_response"):
+        return "__end__"
+    if int(state.get("tool_rounds") or 0) >= _MAX_TOOL_ROUNDS:
+        return "__end__"
+    return "agent"
+
+
 # ── Graph assembly ─────────────────────────────────────────────────────────────
+
 
 def build_helpdesk_graph(checkpointer: Any | None = None):
     workflow = StateGraph(HelpdeskAgentState)
@@ -558,7 +373,11 @@ def build_helpdesk_graph(checkpointer: Any | None = None):
         _route_after_agent,
         {"tools": "tools", "__end__": END},
     )
-    workflow.add_edge("tools", "agent")
+    workflow.add_conditional_edges(
+        "tools",
+        _route_after_tools,
+        {"agent": "agent", "__end__": END},
+    )
 
     return workflow.compile(checkpointer=checkpointer)
 
@@ -614,7 +433,7 @@ def _chat_invoke_config(
 
     return {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": 15,
+        "recursion_limit": 14,
         "run_name": "helpdesk_chat_turn",
         "tags": tags,
         "metadata": metadata,
@@ -622,6 +441,7 @@ def _chat_invoke_config(
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
+
 
 def run_chat_turn(
     *,
@@ -653,7 +473,7 @@ def run_chat_turn(
         "ticket_id": None,
         "messages_snapshot": [],
     }
-    _REQUEST_CTX.set(ctx)
+    install_request_context(ctx)
 
     graph = get_helpdesk_graph()
     final_state = graph.invoke(
@@ -663,6 +483,9 @@ def run_chat_turn(
             "thread_id": thread_id,
             "app_name": app_name,
             "environment": environment,
+            # Reset per-turn tool counter so checkpointer never carries a
+            # stale value from the previous turn into this one.
+            "tool_rounds": 0,
             "user_clearance": clearance,
         },
         config=_chat_invoke_config(
@@ -676,11 +499,17 @@ def run_chat_turn(
     # Find the last non-tool-call AI message — that's what the user sees.
     all_messages: list[BaseMessage] = final_state.get("messages", [])
     last_ai = next(
-        (m for m in reversed(all_messages) if isinstance(m, AIMessage) and not m.tool_calls),
+        (
+            m
+            for m in reversed(all_messages)
+            if isinstance(m, AIMessage) and not m.tool_calls
+        ),
         None,
     )
     response_text = (
-        str(last_ai.content) if last_ai else "I'm unable to process your request right now."
+        str(last_ai.content)
+        if last_ai
+        else "I'm unable to process your request right now."
     )
 
     # Post-process: scrub any PII / secrets that slipped through.
@@ -689,7 +518,9 @@ def run_chat_turn(
         response_text = redacted
 
     # Determine the route label used by the API and frontend.
-    route: Literal["follow_up", "self_resolution", "ticket_created", "blocked"] = "follow_up"
+    route: Literal["follow_up", "self_resolution", "ticket_created", "blocked"] = (
+        "follow_up"
+    )
     if final_state.get("is_blocked") or final_state.get("route") == "blocked":
         route = "blocked"
     elif ctx.get("ticket_id"):
@@ -697,10 +528,27 @@ def run_chat_turn(
     elif ctx.get("kb_refs"):
         route = "self_resolution"
 
+    # If the LLM called render_chart, wrap the response with the chart config.
+    agent_response: AgentResponse | None = None
+    chart_data = ctx.get("chart")
+    if chart_data:
+        try:
+            from app.schemas import ChartConfiguration
+
+            agent_response = AgentResponse(
+                markdown_text=response_text,
+                chart=ChartConfiguration(**chart_data),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to build AgentResponse from chart ctx", exc_info=True
+            )
+
     return ChatTurnResult(
         thread_id=thread_id,
         response=response_text,
         route=route,
         ticket_id=ctx.get("ticket_id"),
         linked_kb_articles=ctx.get("kb_refs", []),
+        agent_response=agent_response,
     )

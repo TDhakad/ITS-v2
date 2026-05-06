@@ -1,4 +1,4 @@
-import { Bot, FileText, MessageSquare, Plus, Send, Shield, Ticket as TicketIcon } from "lucide-react";
+import { Bot, FileText, MessageSquare, Plus, Send, Shield, Ticket as TicketIcon, Trash2 } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -12,6 +12,7 @@ import { api } from "../api/client";
 import { formatTime, generateId, kbReferenceHref } from "../lib";
 import type { ApiUser, ChatHistoryMessage, ChatMessage, ChatThread, LoadState, Ticket } from "../types";
 import { Button, EmptyState, LoadingState } from "./common";
+import { AgentResponseMessage } from "./ChatMessage";
 import { MarkdownContent } from "./MarkdownContent";
 
 interface AssistantPageProps {
@@ -45,6 +46,7 @@ export function AssistantPage({
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [threads, setThreads] = useState<ChatThread[]>([]);
+  const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
 
   const recentTickets = useMemo(() => tickets.slice(0, 6), [tickets]);
@@ -125,6 +127,30 @@ export function AssistantPage({
       });
   }
 
+  async function deleteThread(threadId: string) {
+    if (deletingThreadId) {
+      return;
+    }
+    setDeletingThreadId(threadId);
+    setError(null);
+    try {
+      await api.deleteChatThread(threadId);
+      setThreads((current) => current.filter((thread) => thread.thread_id !== threadId));
+      if (conversationId === threadId) {
+        const nextThreadId = newThreadId(user);
+        setConversationId(nextThreadId);
+        rememberThreadId(threadStorageKey(user), nextThreadId);
+        setMessages([defaultAssistantMessage("Conversation deleted.")]);
+        setState("idle");
+      }
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Could not delete conversation.";
+      setError(message);
+    } finally {
+      setDeletingThreadId(null);
+    }
+  }
+
   async function submitMessage(value: string) {
     const trimmed = value.trim();
     if (!trimmed || state === "loading") {
@@ -137,54 +163,125 @@ export function AssistantPage({
       content: trimmed,
       createdAt: new Date().toISOString()
     };
+    const assistantMessageId = generateId("msg");
+    const assistantCreatedAt = new Date().toISOString();
 
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+        createdAt: assistantCreatedAt,
+      },
+    ]);
     setInput("");
     setState("loading");
     setError(null);
+    let streamFailed = false;
 
     try {
-      const response = await api.chat({
-        message: trimmed,
-        conversation_id: conversationId,
-        thread_id: conversationId,
-        user_id: user ? String(user.id) : "anonymous",
-        environment: "unknown",
-        clearance: user?.clearance ?? "public",
-        project_id: projectId
-      });
-
-      if (response.ticket) {
-        onTicketCreated(response.ticket);
-      }
-
-      setConversationId(response.thread_id || response.conversation_id || conversationId);
-      rememberThreadId(threadStorageKey(user), response.thread_id || response.conversation_id || conversationId);
-      setMessages((current) => [
-        ...current,
+      await api.chatStream(
         {
-          id: generateId("msg"),
-          role: "assistant",
-          content: response.response || response.message || "No response content returned.",
-          createdAt: new Date().toISOString(),
-          citations: response.citations ?? response.references,
-          ticket: response.ticket
-        }
-      ]);
-      setState("ready");
-      refreshThreads();
+          message: trimmed,
+          conversation_id: conversationId,
+          thread_id: conversationId,
+          user_id: user ? String(user.id) : "anonymous",
+          environment: "unknown",
+          clearance: user?.clearance ?? "public",
+          project_id: projectId,
+        },
+        {
+          onStart: (streamMeta) => {
+            const nextThreadId =
+              streamMeta.thread_id || streamMeta.conversation_id || conversationId;
+            setConversationId(nextThreadId);
+            rememberThreadId(threadStorageKey(user), nextThreadId);
+          },
+          // Thinking stream temporarily disabled.
+          onMessageToken: (token) => {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantMessageId
+                  ? {
+                      ...message,
+                      content: `${message.content}${token}`,
+                      isStreaming: true,
+                    }
+                  : message,
+              ),
+            );
+          },
+          onFinal: (response) => {
+            if (response.ticket) {
+              onTicketCreated(response.ticket);
+            }
+
+            const nextThreadId =
+              response.thread_id || response.conversation_id || conversationId;
+            setConversationId(nextThreadId);
+            rememberThreadId(threadStorageKey(user), nextThreadId);
+
+            setMessages((current) =>
+              current.map((message) => {
+                if (message.id !== assistantMessageId) {
+                  return message;
+                }
+                return {
+                  ...message,
+                  content:
+                    response.response
+                    || response.message
+                    || message.content
+                    || "No response content returned.",
+                  citations: response.citations ?? response.references,
+                  ticket: response.ticket,
+                  agentResponse: response.agent_response ?? null,
+                  isStreaming: false,
+                };
+              }),
+            );
+          },
+          onError: (message) => {
+            streamFailed = true;
+            setError(message);
+            setMessages((current) =>
+              current.map((entry) =>
+                entry.id === assistantMessageId
+                  ? {
+                      ...entry,
+                      content: entry.content || message,
+                      isStreaming: false,
+                    }
+                  : entry,
+              ),
+            );
+          },
+        },
+      );
+
+      if (streamFailed) {
+        setState("error");
+      } else {
+        setState("ready");
+        refreshThreads();
+      }
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Assistant request failed.";
       setError(message);
-      setMessages((current) => [
-        ...current,
-        {
-          id: generateId("msg"),
-          role: "assistant",
-          content: message,
-          createdAt: new Date().toISOString()
-        }
-      ]);
+      setMessages((current) =>
+        current.map((entry) =>
+          entry.id === assistantMessageId
+            ? {
+                ...entry,
+                content: entry.content || message,
+                isStreaming: false,
+              }
+            : entry,
+        ),
+      );
       setState("error");
     }
   }
@@ -223,17 +320,32 @@ export function AssistantPage({
           <p className="side-section">Conversations</p>
           {threads.length ? (
             threads.map((thread) => (
-              <button
-                className={`history-item${thread.thread_id === conversationId ? " active" : ""}`}
+              <div
+                className={`history-item-row${thread.thread_id === conversationId ? " active" : ""}`}
                 key={thread.thread_id}
-                onClick={() => loadThread(thread.thread_id)}
               >
-                <span className="history-item-preview">
-                  <MessageSquare size={13} aria-hidden="true" />
-                  {thread.preview || "Conversation"}
-                </span>
-                <small>{thread.last_at ? formatTime(thread.last_at) : ""}</small>
-              </button>
+                <button
+                  className={`history-item${thread.thread_id === conversationId ? " active" : ""}`}
+                  onClick={() => loadThread(thread.thread_id)}
+                >
+                  <span className="history-item-preview">
+                    <MessageSquare size={13} aria-hidden="true" />
+                    {thread.preview || "Conversation"}
+                  </span>
+                  <small>{thread.last_at ? formatTime(thread.last_at) : ""}</small>
+                </button>
+                <button
+                  className="history-item-delete"
+                  type="button"
+                  aria-label="Delete conversation"
+                  disabled={deletingThreadId === thread.thread_id}
+                  onClick={() => {
+                    void deleteThread(thread.thread_id);
+                  }}
+                >
+                  <Trash2 size={13} aria-hidden="true" />
+                </button>
+              </div>
             ))
           ) : (
             <p className="muted-text padded">No past conversations.</p>
@@ -267,10 +379,15 @@ export function AssistantPage({
                   <strong>{message.role === "user" ? (user?.display_name ?? "You") : "AI Assistant"}</strong>
                   <span>{formatTime(message.createdAt)}</span>
                 </div>
-                <MarkdownContent
-                  content={message.content}
-                  onTicketSelect={onTicketSelect}
-                />
+                {/* Thinking UI temporarily disabled. */}
+                {message.agentResponse ? (
+                  <AgentResponseMessage message={message.agentResponse} />
+                ) : (
+                  <MarkdownContent
+                    content={message.content}
+                    onTicketSelect={onTicketSelect}
+                  />
+                )}
                 {message.citations?.length ? (
                   <div className="source-row">
                     {message.citations.slice(0, 4).map((citation) => {
@@ -399,6 +516,7 @@ function historyMessageToChatMessage(message: ChatHistoryMessage, index: number)
     id: message.id || `history-${index}`,
     role: message.role,
     content: message.content,
-    createdAt: message.created_at || new Date().toISOString()
+    createdAt: message.created_at || new Date().toISOString(),
+    agentResponse: message.agent_response ?? undefined,
   };
 }

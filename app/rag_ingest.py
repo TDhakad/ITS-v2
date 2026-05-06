@@ -64,7 +64,9 @@ def get_vectorstore(
     active_settings = settings or get_settings()
     if not active_settings.pinecone_api_key:
         raise RuntimeError("PINECONE_API_KEY is required for Pinecone vector search.")
-    selected_index = index_name or collection_name or active_settings.pinecone_kb_index_name
+    selected_index = (
+        index_name or collection_name or active_settings.pinecone_kb_index_name
+    )
     return PineconeVectorStore(
         index_name=selected_index,
         embedding=embedding or get_embedding_model(active_settings),
@@ -137,12 +139,16 @@ def split_markdown_documents(
     source_counts: dict[str, int] = {}
     for chunk in chunks:
         metadata = dict(chunk.metadata)
-        source_id = str(metadata.get("source_id", _stable_id(str(metadata.get("source", "")))))
+        source_id = str(
+            metadata.get("source_id", _stable_id(str(metadata.get("source", ""))))
+        )
         chunk_index = source_counts.get(source_id, 0)
         source_counts[source_id] = chunk_index + 1
 
         metadata["chunk_index"] = chunk_index
-        metadata["chunk_id"] = _stable_id(f"{source_id}:{chunk_index}:{chunk.page_content[:80]}")
+        metadata["chunk_id"] = _stable_id(
+            f"{source_id}:{chunk_index}:{chunk.page_content[:80]}"
+        )
         metadata["section"] = _section_title(metadata, chunk.page_content)
         chunk.metadata = _sanitize_metadata(metadata)
 
@@ -193,7 +199,9 @@ def ingest_markdown_kb(
             index_name=selected_index,
         )
 
-    vectorstore.add_documents(chunks, ids=[str(chunk.metadata["chunk_id"]) for chunk in chunks])
+    vectorstore.add_documents(
+        chunks, ids=[str(chunk.metadata["chunk_id"]) for chunk in chunks]
+    )
     return IngestionReport(
         kb_dir=kb_path,
         index_name=selected_index,
@@ -248,7 +256,9 @@ def _document_metadata(
     body: str,
 ) -> dict[str, str | int | float | bool]:
     source = relative_path.as_posix()
-    title = str(front_matter.get("title") or _extract_first_heading(body) or relative_path.stem)
+    title = str(
+        front_matter.get("title") or _extract_first_heading(body) or relative_path.stem
+    )
     category = front_matter.get("category")
     if not category:
         category = relative_path.parts[0] if len(relative_path.parts) > 1 else "infra"
@@ -282,7 +292,9 @@ def _document_metadata(
     return _sanitize_metadata(metadata)
 
 
-def _sanitize_metadata(metadata: Mapping[str, Any]) -> dict[str, str | int | float | bool]:
+def _sanitize_metadata(
+    metadata: Mapping[str, Any]
+) -> dict[str, str | int | float | bool]:
     sanitized: dict[str, str | int | float | bool] = {}
     for key, value in metadata.items():
         safe_key = _normalize_key(str(key))

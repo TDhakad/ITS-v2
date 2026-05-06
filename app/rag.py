@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from app.rag_ingest import (
     DEFAULT_COLLECTION_NAME,
-    DEFAULT_KB_INDEX_NAME,
     DEFAULT_KB_DIR,
+    DEFAULT_KB_INDEX_NAME,
     IngestionReport,
     get_vectorstore,
     ingest_markdown_kb,

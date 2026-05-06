@@ -1,0 +1,31 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE users (
+	id INTEGER NOT NULL, 
+	email VARCHAR(254) NOT NULL, 
+	display_name VARCHAR(120) NOT NULL, 
+	hashed_password VARCHAR(256) NOT NULL, 
+	role VARCHAR(40) NOT NULL, 
+	clearance VARCHAR(40) NOT NULL, 
+	is_active BOOLEAN NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	last_login_at DATETIME, 
+	PRIMARY KEY (id)
+)
+
+Column Details:
+-- id: Primary key for the user record.
+-- email: Unique login email stored in lowercase.
+-- display_name: Display name shown in the application UI.
+-- hashed_password: Password hash; never stores plaintext passwords.
+-- role: Authorization role. Available options: user, agent, admin.
+-- clearance: Data visibility clearance. Available options: public, internal, restricted.
+-- is_active: Soft-delete/enable flag for account access.
+-- created_at: UTC timestamp when the user account was created.
+-- last_login_at: UTC timestamp of the most recent successful login.
+
+HINTS: 
+To join 'project_members' and 'users', use project_members.user_id = users.id
+To join 'auth_sessions' and 'users', use auth_sessions.user_id = users.id

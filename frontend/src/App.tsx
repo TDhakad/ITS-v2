@@ -170,7 +170,7 @@ export default function App() {
   const loadTickets = useCallback(async (projectId: number | null) => {
     dispatch({ type: "tickets-loading" });
     try {
-      const response = await api.listTickets(100, projectId);
+      const response = await api.listTickets(150, projectId);
       dispatch({ type: "tickets-ready", tickets: response.tickets });
     } catch (caught) {
       dispatch({ type: "tickets-error", error: errorMessage(caught) });

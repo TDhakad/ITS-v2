@@ -4,6 +4,7 @@ Usage:
     uv run python scripts/create_admin.py
     uv run python scripts/create_admin.py --email admin@example.com --name "Admin" --password secret
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,6 +34,7 @@ def create_admin(email: str, display_name: str, password: str) -> None:
             return
 
         from app.db import UserRecord
+
         record = UserRecord(
             email=email.casefold(),
             display_name=display_name,
@@ -46,16 +48,22 @@ def create_admin(email: str, display_name: str, password: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create an admin user for ITS Helpdesk.")
-    parser.add_argument("--email",    default="admin@its.local")
-    parser.add_argument("--name",     default="Admin")
-    parser.add_argument("--password", default=None,
-                        help="If omitted, you will be prompted (input hidden).")
+    parser = argparse.ArgumentParser(
+        description="Create an admin user for ITS Helpdesk."
+    )
+    parser.add_argument("--email", default="admin@its.local")
+    parser.add_argument("--name", default="Admin")
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="If omitted, you will be prompted (input hidden).",
+    )
     args = parser.parse_args()
 
     password = args.password
     if not password:
         import getpass
+
         password = getpass.getpass(f"Password for {args.email}: ")
         if not password:
             print("Password cannot be empty.")

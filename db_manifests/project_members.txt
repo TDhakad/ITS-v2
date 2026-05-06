@@ -1,0 +1,24 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE project_members (
+	id INTEGER NOT NULL, 
+	project_id INTEGER NOT NULL, 
+	user_id INTEGER NOT NULL, 
+	access_level VARCHAR(40) NOT NULL, 
+	PRIMARY KEY (id), 
+	CONSTRAINT uq_project_user UNIQUE (project_id, user_id), 
+	FOREIGN KEY(project_id) REFERENCES projects (id) ON DELETE CASCADE, 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+)
+
+Column Details:
+-- id: Primary key for project membership row.
+-- project_id: Foreign key to projects.id.
+-- user_id: Foreign key to users.id.
+-- access_level: Project access level. Available options: viewer, member, owner.
+
+HINTS: 
+To join 'project_members' and 'users', use project_members.user_id = users.id
+To join 'project_members' and 'projects', use project_members.project_id = projects.id

@@ -41,6 +41,19 @@ export interface ConversationMessage {
   created_at?: string;
 }
 
+export interface TicketComment {
+  id: number;
+  ticket_id: number;
+  parent_comment_id: number | null;
+  author_user_id: number;
+  author_display_name: string;
+  author_role: "user" | "agent" | "admin";
+  content: string;
+  created_at: string;
+  updated_at: string;
+  edited: boolean;
+}
+
 export interface Ticket {
   id: number;
   ticket_id: number;
@@ -99,6 +112,7 @@ export interface ChatResponse {
   citations?: KBReference[];
   references?: KBReference[];
   ticket?: Ticket;
+  agent_response?: AgentResponse | null;
 }
 
 export interface ChatHistoryMessage {
@@ -106,6 +120,7 @@ export interface ChatHistoryMessage {
   role: "user" | "assistant";
   content: string;
   created_at?: string | null;
+  agent_response?: AgentResponse | null;
 }
 
 export interface ChatHistoryResponse {
@@ -149,6 +164,25 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  thinking?: string;
+  isStreaming?: boolean;
   citations?: KBReference[];
   ticket?: Ticket;
+  agentResponse?: AgentResponse | null;
+}
+
+// ── Chart / structured agent response ─────────────────────────────────────────
+
+export interface ChartConfiguration {
+  chart_type: "line" | "bar";
+  title: string;
+  data: Record<string, unknown>[];
+  x_axis_key: string;
+  data_keys: string[];
+  colors?: string[] | null;
+}
+
+export interface AgentResponse {
+  markdown_text?: string | null;
+  chart?: ChartConfiguration | null;
 }

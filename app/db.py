@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Generator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Float,
     ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    and_,
     cast,
     create_engine,
     event,
@@ -90,7 +90,9 @@ engine = create_engine(
     future=True,
     **_engine_kwargs(settings.database_url),
 )
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+SessionLocal = sessionmaker(
+    bind=engine, autoflush=False, autocommit=False, expire_on_commit=False
+)
 
 
 @event.listens_for(engine, "connect")
@@ -99,23 +101,78 @@ def set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
     if settings.database_url.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            logger.debug("SQLite WAL mode unavailable for this connection")
         cursor.close()
 
 
 # ── Auth models ───────────────────────────────────────────────────────────────
 
+
 class UserRecord(Base):
+    """Stores application user accounts used for authentication and authorization.
+
+    This table represents people or service users who can sign in and access the
+    platform. It tracks account lifecycle state (active/inactive), role-based
+    permissions (for example user/agent/admin), and clearance level for data
+    visibility boundaries.
+    """
+
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    email: Mapped[str] = mapped_column(String(254), unique=True, index=True, nullable=False)
-    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
-    hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
-    role: Mapped[str] = mapped_column(String(40), default=UserRole.USER.value, index=True)
-    clearance: Mapped[str] = mapped_column(String(40), default=UserClearance.PUBLIC.value)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        comment="Primary key for the user record.",
+    )
+    email: Mapped[str] = mapped_column(
+        String(254),
+        unique=True,
+        index=True,
+        nullable=False,
+        comment="Unique login email stored in lowercase.",
+    )
+    display_name: Mapped[str] = mapped_column(
+        String(120),
+        nullable=False,
+        comment="Display name shown in the application UI.",
+    )
+    hashed_password: Mapped[str] = mapped_column(
+        String(256),
+        nullable=False,
+        comment="Password hash; never stores plaintext passwords.",
+    )
+    role: Mapped[str] = mapped_column(
+        String(40),
+        default=UserRole.USER.value,
+        index=True,
+        comment="Authorization role. Available options: user, agent, admin.",
+    )
+    clearance: Mapped[str] = mapped_column(
+        String(40),
+        default=UserClearance.PUBLIC.value,
+        comment="Data visibility clearance. Available options: public, internal, restricted.",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        index=True,
+        comment="Soft-delete/enable flag for account access.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        comment="UTC timestamp when the user account was created.",
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="UTC timestamp of the most recent successful login.",
+    )
 
     project_memberships: Mapped[list[ProjectMemberRecord]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -126,49 +183,151 @@ class UserRecord(Base):
 
 
 class AuthSessionRecord(Base):
+    """Stores active and historical login sessions for signed-in users.
+
+    Each row corresponds to one issued authentication session token with an
+    expiry timestamp. This model supports session validation, logout, and
+    automatic invalidation of sessions that are expired or removed.
+    """
+
     __tablename__ = "auth_sessions"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # opaque token
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    user_agent: Mapped[str] = mapped_column(String(512), default="")
-    ip_address: Mapped[str] = mapped_column(String(64), default="")
+    id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        comment="Opaque session token used as the session primary key.",
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to users.id for session ownership.",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+        comment="UTC timestamp when the session expires.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        comment="UTC timestamp when the session was created.",
+    )
+    user_agent: Mapped[str] = mapped_column(
+        String(512),
+        default="",
+        comment="User-Agent captured at login time.",
+    )
+    ip_address: Mapped[str] = mapped_column(
+        String(64),
+        default="",
+        comment="Client IP address captured at login time.",
+    )
 
     user: Mapped[UserRecord] = relationship(back_populates="sessions")
 
 
 class ChatMessageRecord(Base):
+    """Persists general chat assistant conversations outside ticket workflows.
+
+    This table stores the message history for chat threads used in the assistant
+    experience. It is primarily used to reconstruct prior context, display chat
+    history, and provide previews of recent conversations.
+    """
+
     __tablename__ = "chat_messages"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[str] = mapped_column(String(120), index=True)
-    thread_id: Mapped[str] = mapped_column(String(120), index=True)
-    role: Mapped[str] = mapped_column(String(40), index=True)
-    content: Mapped[str] = mapped_column(Text)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for the chat message row.",
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(120),
+        index=True,
+        comment="Application user identifier for the chat thread.",
+    )
+    thread_id: Mapped[str] = mapped_column(
+        String(120),
+        index=True,
+        comment="Conversation thread identifier.",
+    )
+    role: Mapped[str] = mapped_column(
+        String(40),
+        index=True,
+        comment="Message author role. Available options: user, assistant, system.",
+    )
+    content: Mapped[str] = mapped_column(
+        Text,
+        comment="Raw chat message content.",
+    )
+    agent_response: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+        comment="JSON-serialised AgentResponse (chart config etc.) for assistant messages.",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
         index=True,
+        comment="UTC timestamp when the chat message was stored.",
     )
 
 
 # ── Project models ─────────────────────────────────────────────────────────────
 
+
 class ProjectRecord(Base):
+    """Represents tenant-like project workspaces in the ITS platform.
+
+    Projects are used to group operational data and access scope for teams.
+    Records here define the project identity and lifecycle state, and serve as
+    the anchor for memberships and KB visibility links.
+    """
+
     __tablename__ = "projects"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
-    slug: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
-    description: Mapped[str] = mapped_column(Text, default="")
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        comment="Primary key for the project record.",
+    )
+    name: Mapped[str] = mapped_column(
+        String(120),
+        unique=True,
+        nullable=False,
+        comment="Unique human-friendly project name.",
+    )
+    slug: Mapped[str] = mapped_column(
+        String(80),
+        unique=True,
+        index=True,
+        nullable=False,
+        comment="Unique URL-safe project identifier.",
+    )
+    description: Mapped[str] = mapped_column(
+        Text,
+        default="",
+        comment="Project description shown in management views.",
+    )
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+        comment="Owning user id; nullable when owner is removed.",
     )
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        index=True,
+        comment="Soft-enable flag for project availability.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        comment="UTC timestamp when the project was created.",
+    )
 
     members: Mapped[list[ProjectMemberRecord]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
@@ -179,16 +338,38 @@ class ProjectRecord(Base):
 
 
 class ProjectMemberRecord(Base):
-    __tablename__ = "project_members"
-    __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_user"),)
+    """Maps users to projects with a project-specific access level.
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    This junction table controls who can access a given project and at what
+    capability level (such as viewer/member/owner). The unique project-user
+    constraint ensures each user has a single effective membership per project.
+    """
+
+    __tablename__ = "project_members"
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", name="uq_project_user"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for project membership row.",
+    )
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"),
         index=True,
+        comment="Foreign key to projects.id.",
     )
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    access_level: Mapped[str] = mapped_column(String(40), default=ProjectAccessLevel.MEMBER.value)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to users.id.",
+    )
+    access_level: Mapped[str] = mapped_column(
+        String(40),
+        default=ProjectAccessLevel.MEMBER.value,
+        comment="Project access level. Available options: viewer, member, owner.",
+    )
 
     project: Mapped[ProjectRecord] = relationship(back_populates="members")
     user: Mapped[UserRecord] = relationship(back_populates="project_memberships")
@@ -196,14 +377,46 @@ class ProjectMemberRecord(Base):
 
 # ── Tag models ─────────────────────────────────────────────────────────────────
 
+
 class TagRecord(Base):
+    """Defines reusable classification tags shared across tickets and KB links.
+
+    Tags provide a normalized vocabulary for categorization, filtering, and
+    analytics. They are intended to be stable labels (for example impact areas)
+    that can be attached to tickets and knowledge-base documents.
+    """
+
     __tablename__ = "tags"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String(60), unique=True, nullable=False)
-    slug: Mapped[str] = mapped_column(String(60), unique=True, index=True, nullable=False)
-    color: Mapped[str] = mapped_column(String(20), default="#64748b")
-    description: Mapped[str] = mapped_column(String(500), default="")
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        comment="Primary key for tag record.",
+    )
+    name: Mapped[str] = mapped_column(
+        String(60),
+        unique=True,
+        nullable=False,
+        comment="Unique display name for the tag.",
+    )
+    slug: Mapped[str] = mapped_column(
+        String(60),
+        unique=True,
+        index=True,
+        nullable=False,
+        comment="Unique URL-safe tag identifier.",
+    )
+    color: Mapped[str] = mapped_column(
+        String(20),
+        default="#64748b",
+        comment="Hex color code used for tag badges.",
+    )
+    description: Mapped[str] = mapped_column(
+        String(500),
+        default="",
+        comment="Optional tag description.",
+    )
 
     ticket_links: Mapped[list[TicketTagRecord]] = relationship(
         back_populates="tag", cascade="all, delete-orphan"
@@ -214,37 +427,88 @@ class TagRecord(Base):
 
 
 class TicketTagRecord(Base):
+    """Junction table linking support tickets to classification tags.
+
+    This model enables many-to-many tag assignment on tickets so tickets can be
+    filtered, searched, and summarized by multiple thematic labels.
+    """
+
     __tablename__ = "ticket_tags"
     __table_args__ = (UniqueConstraint("ticket_id", "tag_id", name="uq_ticket_tag"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
-    tag_id: Mapped[int] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"), index=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for ticket-tag link row.",
+    )
+    ticket_id: Mapped[int] = mapped_column(
+        ForeignKey("tickets.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to tickets.id.",
+    )
+    tag_id: Mapped[int] = mapped_column(
+        ForeignKey("tags.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to tags.id.",
+    )
 
     ticket: Mapped[TicketRecord] = relationship(back_populates="tag_links")
     tag: Mapped[TagRecord] = relationship(back_populates="ticket_links")
 
 
 class KBTagRecord(Base):
+    """Junction table linking knowledge-base documents to tags.
+
+    It supports tag-driven retrieval and categorization of KB content so the
+    assistant can discover relevant documentation by topic.
+    """
+
     __tablename__ = "kb_tags"
     __table_args__ = (UniqueConstraint("kb_id", "tag_id", name="uq_kb_tag"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    kb_id: Mapped[str] = mapped_column(String(255), index=True)
-    tag_id: Mapped[int] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"), index=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for KB-tag link row.",
+    )
+    kb_id: Mapped[str] = mapped_column(
+        String(255),
+        index=True,
+        comment="Knowledge-base document identifier.",
+    )
+    tag_id: Mapped[int] = mapped_column(
+        ForeignKey("tags.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to tags.id.",
+    )
 
     tag: Mapped[TagRecord] = relationship(back_populates="kb_links")
 
 
 class KBProjectLinkRecord(Base):
+    """Junction table that scopes KB documents to one or more projects.
+
+    This association is used for project-level data isolation so users only see
+    knowledge-base documents that are linked to projects they can access.
+    """
+
     __tablename__ = "kb_project_links"
     __table_args__ = (UniqueConstraint("kb_id", "project_id", name="uq_kb_project"),)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    kb_id: Mapped[str] = mapped_column(String(255), index=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for KB-project link row.",
+    )
+    kb_id: Mapped[str] = mapped_column(
+        String(255),
+        index=True,
+        comment="Knowledge-base document identifier.",
+    )
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"),
         index=True,
+        comment="Foreign key to projects.id.",
     )
 
     project: Mapped[ProjectRecord] = relationship(back_populates="kb_links")
@@ -252,66 +516,149 @@ class KBProjectLinkRecord(Base):
 
 # ── Ticket model ───────────────────────────────────────────────────────────────
 
+
 class TicketRecord(Base):
+    """Primary incident/support ticket entity for operational issue tracking.
+
+    Each row is a ticket raised in the ITS workflow and stores its current
+    lifecycle state, AI-derived triage metadata, and resolution context.
+    Typical status values in this table include Open, Triaged, In Progress,
+    Resolved, and Closed, which represent the ticket's movement from intake to
+    completion.
+    """
+
     __tablename__ = "tickets"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    status: Mapped[str] = mapped_column(String(40), default=TicketStatus.OPEN.value, index=True)
-    user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
-    thread_id: Mapped[str] = mapped_column(String(120), index=True)
-    app_name: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+        comment="Primary key for ticket record.",
+    )
+    status: Mapped[str] = mapped_column(
+        String(40),
+        default=TicketStatus.OPEN.value,
+        index=True,
+        comment=(
+            "Lifecycle status of the ticket. Available options: Open, Triaged, "
+            "In Progress, Resolved, Closed."
+        ),
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(120),
+        default="anonymous",
+        index=True,
+        comment="Creator identifier for the ticket.",
+    )
+    thread_id: Mapped[str] = mapped_column(
+        String(120),
+        index=True,
+        comment="Conversation thread id linked to ticket creation.",
+    )
+    app_name: Mapped[str | None] = mapped_column(
+        String(120),
+        nullable=True,
+        index=True,
+        comment="Application/service name related to the issue.",
+    )
     environment: Mapped[str] = mapped_column(
         String(40),
         default=Environment.UNKNOWN.value,
         index=True,
+        comment="Target runtime environment. Available options: production, staging, development, unknown.",
     )
-    user_clearance: Mapped[str] = mapped_column(String(40), default=UserClearance.PUBLIC.value)
+    user_clearance: Mapped[str] = mapped_column(
+        String(40),
+        default=UserClearance.PUBLIC.value,
+        comment="Clearance level attached to the ticket. Available options: public, internal, restricted.",
+    )
 
     category: Mapped[str] = mapped_column(
         String(128),
         default=TicketCategory.INFRA.value,
         index=True,
+        comment="Classified ticket category. Available options: Bug, Feature, UI, Infra, Hardware.",
     )
     suggested_priority: Mapped[str] = mapped_column(
         String(40),
         default=Priority.MEDIUM.value,
         index=True,
+        comment="Suggested impact priority. Available options: Low, Medium, High, Critical.",
     )
-    summary: Mapped[str] = mapped_column(Text, default="")
-    keywords: Mapped[list[str]] = mapped_column(MutableList.as_mutable(JSON), default=list)
+    summary: Mapped[str] = mapped_column(
+        Text,
+        default="",
+        comment="Normalized short summary of the ticket issue.",
+    )
+    keywords: Mapped[list[str]] = mapped_column(
+        MutableList.as_mutable(JSON),
+        default=list,
+        comment="Extracted keyword list used for search and analytics.",
+    )
 
-    intelligence: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
-    resolution: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
-    guardrail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    intelligence: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        default=dict,
+        comment="Structured classification and triage metadata.",
+    )
+    resolution: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        default=dict,
+        comment="Structured resolution suggestions and linked references.",
+    )
+    guardrail: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Optional safety/guardrail decision payload.",
+    )
     conversation: Mapped[list[dict[str, Any]]] = mapped_column(
         MutableList.as_mutable(JSON),
         default=list,
+        comment="Legacy JSON conversation cache retained for backward compatibility.",
     )
-    raw_context: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
+    raw_context: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        default=dict,
+        comment="Original request context captured at ticket creation.",
+    )
 
     # Project association
     project_id: Mapped[int | None] = mapped_column(
-        ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Owning project id for tenant scoping; nullable for legacy tickets.",
     )
 
     # Legacy column retained so the generated SQLite DB from earlier scaffolding remains usable.
-    sentiment: Mapped[str] = mapped_column(String(40), default="Calm")
+    sentiment: Mapped[str] = mapped_column(
+        String(40),
+        default="Calm",
+        comment="Legacy sentiment label retained for older database compatibility.",
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
         index=True,
+        comment="UTC timestamp when the ticket was created.",
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
         onupdate=utcnow,
+        comment="UTC timestamp of the latest ticket update.",
     )
 
     messages: Mapped[list[TicketMessageRecord]] = relationship(
         back_populates="ticket",
         cascade="all, delete-orphan",
         order_by="TicketMessageRecord.created_at",
+    )
+    comments: Mapped[list[TicketCommentRecord]] = relationship(
+        back_populates="ticket",
+        cascade="all, delete-orphan",
+        order_by="TicketCommentRecord.created_at",
     )
     tag_links: Mapped[list[TicketTagRecord]] = relationship(
         back_populates="ticket",
@@ -320,19 +667,144 @@ class TicketRecord(Base):
 
 
 class TicketMessageRecord(Base):
+    """Stores ordered conversation messages that belong to a specific ticket.
+
+    This table is the authoritative message timeline for ticket discussions and
+    resolution collaboration. It preserves role-based turns (user/assistant/
+    system) for auditability and context reconstruction.
+    """
+
     __tablename__ = "ticket_messages"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True)
-    role: Mapped[str] = mapped_column(String(40), index=True)
-    content: Mapped[str] = mapped_column(Text)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for the ticket message row.",
+    )
+    ticket_id: Mapped[int] = mapped_column(
+        ForeignKey("tickets.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to tickets.id.",
+    )
+    role: Mapped[str] = mapped_column(
+        String(40),
+        index=True,
+        comment="Message author role. Available options: user, assistant, system.",
+    )
+    content: Mapped[str] = mapped_column(
+        Text,
+        comment="Message text for the ticket conversation.",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
         index=True,
+        comment="UTC timestamp when the ticket message was created.",
     )
 
     ticket: Mapped[TicketRecord] = relationship(back_populates="messages")
+
+
+class TicketCommentRecord(Base):
+    """Stores user and admin comments for a ticket, including threaded replies."""
+
+    __tablename__ = "ticket_comments"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        comment="Primary key for the ticket comment row.",
+    )
+    ticket_id: Mapped[int] = mapped_column(
+        ForeignKey("tickets.id", ondelete="CASCADE"),
+        index=True,
+        comment="Foreign key to tickets.id.",
+    )
+    author_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        comment="Author user id for this comment.",
+    )
+    parent_comment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ticket_comments.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="Optional parent comment id for threaded replies.",
+    )
+    content: Mapped[str] = mapped_column(
+        Text,
+        comment="Comment text.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        index=True,
+        comment="UTC timestamp when the comment was created.",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+        comment="UTC timestamp when the comment was last updated.",
+    )
+
+    ticket: Mapped[TicketRecord] = relationship(back_populates="comments")
+    author: Mapped[UserRecord] = relationship()
+    parent: Mapped[TicketCommentRecord | None] = relationship(
+        "TicketCommentRecord",
+        remote_side="TicketCommentRecord.id",
+        back_populates="children",
+    )
+    children: Mapped[list[TicketCommentRecord]] = relationship(
+        "TicketCommentRecord",
+        back_populates="parent",
+        cascade="all, delete-orphan",
+        single_parent=True,
+        order_by="TicketCommentRecord.created_at",
+    )
+
+
+class BackgroundJobRecord(Base):
+    """Durable queue for slow external work owned by the web application."""
+
+    __tablename__ = "background_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class TicketInsightRecord(Base):
+    """Caches expensive ticket insight payloads so read endpoints stay predictable."""
+
+    __tablename__ = "ticket_insights"
+
+    ticket_id: Mapped[int] = mapped_column(
+        ForeignKey("tickets.id", ondelete="CASCADE"), primary_key=True
+    )
+    cache_key: Mapped[str] = mapped_column(String(200), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 def ensure_database_directory() -> None:
@@ -372,6 +844,7 @@ def add_chat_turn_messages(
     thread_id: str,
     user_message: str,
     assistant_message: str,
+    agent_response_json: str | None = None,
 ) -> None:
     now = utcnow()
     db.add_all(
@@ -388,6 +861,7 @@ def add_chat_turn_messages(
                 thread_id=thread_id,
                 role="assistant",
                 content=assistant_message,
+                agent_response=agent_response_json,
                 created_at=utcnow(),
             ),
         ]
@@ -472,6 +946,29 @@ def list_chat_messages(
     return list(db.scalars(stmt).all())
 
 
+def delete_chat_thread_messages(
+    db: Session,
+    *,
+    user_id: str,
+    thread_id: str,
+) -> int:
+    """Delete all messages for one user thread. Returns deleted row count."""
+    records = list(
+        db.scalars(
+            select(ChatMessageRecord).where(
+                ChatMessageRecord.user_id == user_id,
+                ChatMessageRecord.thread_id == thread_id,
+            )
+        ).all()
+    )
+    if not records:
+        return 0
+    for record in records:
+        db.delete(record)
+    db.commit()
+    return len(records)
+
+
 def _ticket_read_options() -> tuple[Any, ...]:
     return (
         selectinload(TicketRecord.messages),
@@ -495,7 +992,9 @@ def _conversation_for_record(record: TicketRecord) -> list[ChatMessage]:
             )
             for message in record.messages
         ]
-    return [ChatMessage.model_validate(message) for message in record.conversation or []]
+    return [
+        ChatMessage.model_validate(message) for message in record.conversation or []
+    ]
 
 
 def _ticket_to_read(record: TicketRecord) -> TicketRead:
@@ -514,14 +1013,20 @@ def _ticket_to_read(record: TicketRecord) -> TicketRead:
         intelligence=TicketIntelligence.model_validate(record.intelligence),
         resolution=ResolutionData(),
         conversation=_conversation_for_record(record),
-        guardrail=GuardrailDecision.model_validate(record.guardrail) if record.guardrail else None,
+        guardrail=(
+            GuardrailDecision.model_validate(record.guardrail)
+            if record.guardrail
+            else None
+        ),
         raw_context=record.raw_context or {},
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
 
 
-def create_ticket(db: Session, ticket: TicketCreate, *, index_vector: bool = True) -> TicketRead:
+def create_ticket(
+    db: Session, ticket: TicketCreate, *, index_vector: bool = True
+) -> TicketRead:
     record = _add_ticket_record(db, ticket)
     db.commit()
     ticket_read = get_ticket(db, record.id)
@@ -572,7 +1077,9 @@ def _add_ticket_record(db: Session, ticket: TicketCreate) -> TicketRecord:
         keywords=ticket.intelligence.keywords,
         intelligence=intelligence,
         resolution=resolution,
-        guardrail=ticket.guardrail.model_dump(mode="json") if ticket.guardrail else None,
+        guardrail=(
+            ticket.guardrail.model_dump(mode="json") if ticket.guardrail else None
+        ),
         # ticket_messages is authoritative; the JSON column remains only for legacy DBs.
         conversation=[],
         raw_context=ticket.raw_context,
@@ -614,11 +1121,15 @@ def get_ticket(db: Session, ticket_id: int) -> TicketRead | None:
 def get_tickets_by_ids(db: Session, ticket_ids: Sequence[int]) -> list[TicketRead]:
     if not ticket_ids:
         return []
-    records = db.scalars(
-        select(TicketRecord)
-        .options(*_ticket_read_options())
-        .where(TicketRecord.id.in_(ticket_ids))
-    ).unique().all()
+    records = (
+        db.scalars(
+            select(TicketRecord)
+            .options(*_ticket_read_options())
+            .where(TicketRecord.id.in_(ticket_ids))
+        )
+        .unique()
+        .all()
+    )
     by_id = {record.id: _ticket_to_read(record) for record in records}
     return [by_id[ticket_id] for ticket_id in ticket_ids if ticket_id in by_id]
 
@@ -659,6 +1170,208 @@ def list_tickets(
     return [_ticket_to_read(record) for record in db.scalars(stmt).unique().all()]
 
 
+def list_ticket_comments(db: Session, ticket_id: int) -> list[TicketCommentRecord]:
+    stmt = (
+        select(TicketCommentRecord)
+        .options(selectinload(TicketCommentRecord.author))
+        .where(TicketCommentRecord.ticket_id == ticket_id)
+        .order_by(TicketCommentRecord.created_at.asc(), TicketCommentRecord.id.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
+def get_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    comment_id: int,
+) -> TicketCommentRecord | None:
+    return db.scalars(
+        select(TicketCommentRecord)
+        .options(selectinload(TicketCommentRecord.author))
+        .where(
+            TicketCommentRecord.ticket_id == ticket_id,
+            TicketCommentRecord.id == comment_id,
+        )
+    ).first()
+
+
+def create_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    author_user_id: int,
+    content: str,
+    parent_comment_id: int | None = None,
+) -> TicketCommentRecord:
+    if parent_comment_id is not None:
+        parent = db.scalars(
+            select(TicketCommentRecord).where(
+                TicketCommentRecord.id == parent_comment_id,
+                TicketCommentRecord.ticket_id == ticket_id,
+            )
+        ).first()
+        if parent is None:
+            raise ValueError("Parent comment was not found for this ticket.")
+
+    record = TicketCommentRecord(
+        ticket_id=ticket_id,
+        author_user_id=author_user_id,
+        parent_comment_id=parent_comment_id,
+        content=content,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return get_ticket_comment(db, ticket_id=ticket_id, comment_id=record.id) or record
+
+
+def update_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    comment_id: int,
+    content: str,
+) -> TicketCommentRecord | None:
+    record = get_ticket_comment(db, ticket_id=ticket_id, comment_id=comment_id)
+    if record is None:
+        return None
+    record.content = content
+    record.updated_at = utcnow()
+    db.commit()
+    db.refresh(record)
+    return get_ticket_comment(db, ticket_id=ticket_id, comment_id=record.id) or record
+
+
+def delete_ticket_comment(
+    db: Session,
+    *,
+    ticket_id: int,
+    comment_id: int,
+) -> bool:
+    record = get_ticket_comment(db, ticket_id=ticket_id, comment_id=comment_id)
+    if record is None:
+        return False
+    db.delete(record)
+    db.commit()
+    return True
+
+
+def enqueue_background_job(
+    db: Session,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    run_after: datetime | None = None,
+    max_attempts: int = 5,
+) -> BackgroundJobRecord:
+    record = BackgroundJobRecord(
+        kind=kind,
+        payload=payload,
+        run_after=run_after or utcnow(),
+        max_attempts=max(1, max_attempts),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def claim_next_background_job(db: Session) -> BackgroundJobRecord | None:
+    now = utcnow()
+    stale_running_before = now - timedelta(minutes=15)
+    record = db.scalars(
+        select(BackgroundJobRecord)
+        .where(
+            or_(
+                BackgroundJobRecord.status == "pending",
+                and_(
+                    BackgroundJobRecord.status == "running",
+                    BackgroundJobRecord.updated_at <= stale_running_before,
+                ),
+            ),
+            BackgroundJobRecord.run_after <= now,
+            BackgroundJobRecord.attempts < BackgroundJobRecord.max_attempts,
+        )
+        .order_by(BackgroundJobRecord.run_after.asc(), BackgroundJobRecord.id.asc())
+        .limit(1)
+    ).first()
+    if record is None:
+        return None
+    record.status = "running"
+    record.attempts += 1
+    record.updated_at = now
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def complete_background_job(db: Session, job: BackgroundJobRecord) -> None:
+    job.status = "succeeded"
+    job.last_error = None
+    job.updated_at = utcnow()
+    db.commit()
+
+
+def fail_background_job(
+    db: Session,
+    job: BackgroundJobRecord,
+    error: str,
+    *,
+    retry_delay_seconds: int = 60,
+) -> None:
+    now = utcnow()
+    job.last_error = error[:2_000]
+    job.updated_at = now
+    if job.attempts >= job.max_attempts:
+        job.status = "failed"
+    else:
+        delay = min(max(retry_delay_seconds, 5) * max(job.attempts, 1), 900)
+        job.status = "pending"
+        job.run_after = now + timedelta(seconds=delay)
+    db.commit()
+
+
+def get_cached_ticket_insight(
+    db: Session,
+    *,
+    ticket_id: int,
+    cache_key: str,
+) -> dict[str, Any] | None:
+    record = db.get(TicketInsightRecord, ticket_id)
+    if record is None or record.cache_key != cache_key:
+        return None
+    now = utcnow()
+    expires_at = record.expires_at
+    if expires_at.tzinfo is None:
+        now = now.replace(tzinfo=None)
+    if expires_at < now:
+        return None
+    return dict(record.payload or {})
+
+
+def save_ticket_insight(
+    db: Session,
+    *,
+    ticket_id: int,
+    cache_key: str,
+    payload: dict[str, Any],
+    ttl_seconds: int = 900,
+) -> TicketInsightRecord:
+    now = utcnow()
+    record = db.get(TicketInsightRecord, ticket_id)
+    if record is None:
+        record = TicketInsightRecord(ticket_id=ticket_id, cache_key=cache_key)
+        db.add(record)
+    record.cache_key = cache_key
+    record.payload = payload
+    record.generated_at = now
+    record.expires_at = now + timedelta(seconds=max(ttl_seconds, 30))
+    db.commit()
+    db.refresh(record)
+    return record
+
+
 def search_tickets(
     db: Session,
     query: str,
@@ -669,6 +1382,7 @@ def search_tickets(
     status: str | None = None,
     priority: str | None = None,
     limit: int = 10,
+    use_vector: bool = True,
 ) -> list[dict[str, Any]]:
     """Semantic ticket search with keyword fallback.
 
@@ -678,14 +1392,18 @@ def search_tickets(
     if not query or not query.strip():
         return []
 
-    vector_results = _search_ticket_vectors(
-        query,
-        user_id=user_id,
-        project_id=project_id,
-        tag_slugs=tag_slugs,
-        status=status,
-        priority=priority,
-        limit=limit,
+    vector_results = (
+        _search_ticket_vectors(
+            query,
+            user_id=user_id,
+            project_id=project_id,
+            tag_slugs=tag_slugs,
+            status=status,
+            priority=priority,
+            limit=limit,
+        )
+        if use_vector
+        else []
     )
 
     tokens = [token.casefold() for token in query.split() if len(token) > 2]
@@ -726,10 +1444,13 @@ def search_tickets(
                     "status": record.status,
                     "priority": record.suggested_priority,
                     "category": record.category,
+                    "app_name": record.app_name,
                     "user_id": record.user_id,
                     "project_id": record.project_id,
                     "tags": _tag_slugs_for_record(record),
-                    "created_at": record.created_at.isoformat() if record.created_at else None,
+                    "created_at": (
+                        record.created_at.isoformat() if record.created_at else None
+                    ),
                     "score": hits,
                     "source": "sql",
                 }
@@ -739,11 +1460,38 @@ def search_tickets(
     if not vector_results:
         return results[:limit]
 
-    seen = {result["ticket_id"] for result in vector_results}
-    merged = [
-        *vector_results,
-        *(result for result in results if result["ticket_id"] not in seen),
-    ]
+    merged_by_id: dict[int, dict[str, Any]] = {}
+    for result in vector_results:
+        item = dict(result)
+        item["vector_score"] = float(item.get("score") or 0.0)
+        item["keyword_score"] = 0
+        merged_by_id[int(item["ticket_id"])] = item
+
+    for result in results:
+        ticket_id = int(result["ticket_id"])
+        keyword_score = int(result.get("score") or 0)
+        existing = merged_by_id.get(ticket_id)
+        if existing is None:
+            item = dict(result)
+            item["keyword_score"] = keyword_score
+            item["vector_score"] = 0.0
+            merged_by_id[ticket_id] = item
+            continue
+
+        existing.update(result)
+        existing["source"] = "hybrid"
+        existing["keyword_score"] = keyword_score
+        existing["vector_score"] = float(existing.get("vector_score") or 0.0)
+
+    merged = list(merged_by_id.values())
+    merged.sort(
+        key=lambda item: (
+            int(item.get("keyword_score") or 0),
+            float(item.get("vector_score") or 0.0),
+            str(item.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
     return merged[:limit]
 
 
@@ -767,7 +1515,9 @@ def find_recent_similar_tickets(
             limit=max(limit, candidate_limit),
         )
     except TicketVectorUnavailableError:
-        logger.warning("Skipping recent similar ticket search because vector search failed")
+        logger.warning(
+            "Skipping recent similar ticket search because vector search failed"
+        )
         return []
 
     results: list[dict[str, Any]] = []
@@ -786,7 +1536,10 @@ def find_recent_similar_tickets(
         )
 
     # ISO-8601 timestamps sort lexicographically in chronological order.
-    results.sort(key=lambda item: (item.get("created_at") or "", item.get("score") or 0.0), reverse=True)
+    results.sort(
+        key=lambda item: (item.get("created_at") or "", item.get("score") or 0.0),
+        reverse=True,
+    )
     return results[:limit]
 
 
@@ -831,10 +1584,14 @@ def _index_ticket_vector(ticket: TicketRead) -> None:
 
         index_ticket(ticket)
     except Exception as exc:
-        logger.warning("Ticket vector indexing failed for ticket %s: %s", ticket.id, exc)
+        logger.warning(
+            "Ticket vector indexing failed for ticket %s: %s", ticket.id, exc
+        )
 
 
-def _index_ticket_vectors(tickets: Sequence[TicketRead], *, batch_size: int = 100) -> None:
+def _index_ticket_vectors(
+    tickets: Sequence[TicketRead], *, batch_size: int = 100
+) -> None:
     if not tickets:
         return
     try:
@@ -842,7 +1599,9 @@ def _index_ticket_vectors(tickets: Sequence[TicketRead], *, batch_size: int = 10
 
         index_tickets(tickets, reset=False, batch_size=batch_size)
     except Exception as exc:
-        logger.warning("Ticket vector batch indexing failed for %s tickets: %s", len(tickets), exc)
+        logger.warning(
+            "Ticket vector batch indexing failed for %s tickets: %s", len(tickets), exc
+        )
 
 
 def _search_ticket_vectors(
@@ -862,7 +1621,9 @@ def _search_ticket_vectors(
     try:
         from app.ticket_vector import search_ticket_vectors, ticket_vector_result_to_api
     except Exception as exc:
-        raise TicketVectorUnavailableError("Ticket vector search dependency unavailable") from exc
+        raise TicketVectorUnavailableError(
+            "Ticket vector search dependency unavailable"
+        ) from exc
 
     try:
         results = search_ticket_vectors(
@@ -883,17 +1644,25 @@ def _search_ticket_vectors(
 
 # ── User helpers ───────────────────────────────────────────────────────────────
 
+
 def get_user_by_email(db: Session, email: str) -> UserRecord | None:
-    return db.scalars(select(UserRecord).where(UserRecord.email == email.casefold())).first()
+    return db.scalars(
+        select(UserRecord).where(UserRecord.email == email.casefold())
+    ).first()
 
 
 def get_user_by_id(db: Session, user_id: int) -> UserRecord | None:
     return db.get(UserRecord, user_id)
 
 
-def create_user(db: Session, email: str, display_name: str, hashed_password: str,
-                role: str = UserRole.USER.value,
-                clearance: str = UserClearance.PUBLIC.value) -> UserRecord:
+def create_user(
+    db: Session,
+    email: str,
+    display_name: str,
+    hashed_password: str,
+    role: str = UserRole.USER.value,
+    clearance: str = UserClearance.PUBLIC.value,
+) -> UserRecord:
     record = UserRecord(
         email=email.casefold(),
         display_name=display_name,
@@ -914,8 +1683,15 @@ def record_login(db: Session, user: UserRecord) -> None:
 
 # ── Session helpers ────────────────────────────────────────────────────────────
 
-def create_auth_session(db: Session, user_id: int, token: str, expires_at: datetime,
-                        user_agent: str = "", ip_address: str = "") -> AuthSessionRecord:
+
+def create_auth_session(
+    db: Session,
+    user_id: int,
+    token: str,
+    expires_at: datetime,
+    user_agent: str = "",
+    ip_address: str = "",
+) -> AuthSessionRecord:
     # Strip timezone so SQLite round-trips as naive UTC consistently.
     naive_expires = expires_at.replace(tzinfo=None) if expires_at.tzinfo else expires_at
     record = AuthSessionRecord(
@@ -950,6 +1726,7 @@ def delete_auth_session(db: Session, token: str) -> None:
 
 # ── Project helpers ────────────────────────────────────────────────────────────
 
+
 def create_project(db: Session, project: ProjectCreate) -> ProjectRecord:
     record = ProjectRecord(
         name=project.name,
@@ -974,8 +1751,12 @@ def list_projects(db: Session, *, active_only: bool = True) -> list[ProjectRecor
     return list(db.scalars(stmt).all())
 
 
-def add_project_member(db: Session, project_id: int, user_id: int,
-                       access_level: str = ProjectAccessLevel.MEMBER.value) -> ProjectMemberRecord:
+def add_project_member(
+    db: Session,
+    project_id: int,
+    user_id: int,
+    access_level: str = ProjectAccessLevel.MEMBER.value,
+) -> ProjectMemberRecord:
     existing = db.scalars(
         select(ProjectMemberRecord)
         .where(ProjectMemberRecord.project_id == project_id)
@@ -985,7 +1766,9 @@ def add_project_member(db: Session, project_id: int, user_id: int,
         existing.access_level = access_level
         db.commit()
         return existing
-    record = ProjectMemberRecord(project_id=project_id, user_id=user_id, access_level=access_level)
+    record = ProjectMemberRecord(
+        project_id=project_id, user_id=user_id, access_level=access_level
+    )
     db.add(record)
     db.commit()
     return record
@@ -1009,6 +1792,7 @@ def list_project_members(db: Session, project_id: int) -> list[ProjectMemberReco
     return list(
         db.scalars(
             select(ProjectMemberRecord)
+            .options(selectinload(ProjectMemberRecord.user))
             .where(ProjectMemberRecord.project_id == project_id)
             .order_by(ProjectMemberRecord.id)
         ).all()
@@ -1024,6 +1808,7 @@ def list_users(db: Session, *, active_only: bool = True) -> list[UserRecord]:
 
 # ── Tag helpers ────────────────────────────────────────────────────────────────
 
+
 def get_or_create_tag(db: Session, slug: str) -> TagRecord | None:
     return db.scalars(select(TagRecord).where(TagRecord.slug == slug)).first()
 
@@ -1037,11 +1822,13 @@ def seed_default_tags(db: Session) -> None:
     for slug in DEFAULT_TAG_SLUGS:
         exists = db.scalars(select(TagRecord).where(TagRecord.slug == slug)).first()
         if not exists:
-            db.add(TagRecord(
-                name=slug.capitalize(),
-                slug=slug,
-                color=TAG_COLORS.get(slug, "#64748b"),
-            ))
+            db.add(
+                TagRecord(
+                    name=slug.capitalize(),
+                    slug=slug,
+                    color=TAG_COLORS.get(slug, "#64748b"),
+                )
+            )
     db.commit()
 
 

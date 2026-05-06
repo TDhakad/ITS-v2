@@ -119,7 +119,9 @@ class SelfResolutionAnswer(AppModel):
     @model_validator(mode="after")
     def require_escalation_reason(self) -> SelfResolutionAnswer:
         if self.should_escalate and not self.escalation_reason:
-            raise ValueError("escalation_reason is required when should_escalate is true")
+            raise ValueError(
+                "escalation_reason is required when should_escalate is true"
+            )
         return self
 
 
@@ -146,6 +148,7 @@ class ResolutionData(AppModel):
 
 
 # ── Auth & identity ────────────────────────────────────────────────────────────
+
 
 class UserRole(StrEnum):
     USER = "user"
@@ -193,6 +196,7 @@ class SessionRead(AppModel):
 
 # ── Projects ───────────────────────────────────────────────────────────────────
 
+
 class ProjectCreate(AppModel):
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(min_length=1, max_length=80, pattern=r"^[a-z0-9-]+$")
@@ -219,8 +223,14 @@ class ProjectMemberAdd(AppModel):
 # ── Tags ───────────────────────────────────────────────────────────────────────
 
 DEFAULT_TAG_SLUGS = [
-    "ui", "hardware", "access", "infra", "security",
-    "network", "performance", "data",
+    "ui",
+    "hardware",
+    "access",
+    "infra",
+    "security",
+    "network",
+    "performance",
+    "data",
 ]
 
 TAG_COLORS: dict[str, str] = {
@@ -251,6 +261,7 @@ class TagRead(AppModel):
 
 
 # ── Updated ticket models ──────────────────────────────────────────────────────
+
 
 class TicketCreate(AppModel):
     user_id: str = Field(min_length=1, max_length=120)
@@ -289,12 +300,207 @@ class TicketRead(AppModel):
     updated_at: datetime
 
 
+CommentTag = Literal[
+    "detail",
+    "status_update",
+    "rca_clue",
+    "blocker",
+    "ticket_ref",
+    "noise",
+]
+
+
+class CommentClassification(AppModel):
+    tags: list[CommentTag] = Field(default_factory=list, max_length=3)
+    references_tickets: list[str] = Field(default_factory=list, max_length=20)
+    references_systems: list[str] = Field(default_factory=list, max_length=20)
+    references_people: list[str] = Field(default_factory=list, max_length=20)
+    signal_strength: Confidence = 0.0
+    summary: str = Field(default="", max_length=300)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def normalize_tags(cls, value: object) -> object:
+        allowed = {
+            "detail",
+            "status_update",
+            "rca_clue",
+            "blocker",
+            "ticket_ref",
+            "noise",
+        }
+        if value is None:
+            return ["detail"]
+        source = value if isinstance(value, list) else [value]
+        tags: list[str] = []
+        seen: set[str] = set()
+        for item in source:
+            tag = str(item).strip().casefold()
+            if tag not in allowed or tag in seen:
+                continue
+            seen.add(tag)
+            tags.append(tag)
+            if len(tags) >= 3:
+                break
+        return tags or ["detail"]
+
+    @field_validator(
+        "references_tickets",
+        "references_systems",
+        "references_people",
+        mode="before",
+    )
+    @classmethod
+    def normalize_reference_values(cls, value: object) -> object:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return [cleaned] if cleaned else []
+        if isinstance(value, list):
+            deduped: list[str] = []
+            seen: set[str] = set()
+            for item in value:
+                text = str(item).strip()
+                if not text:
+                    continue
+                key = text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(text)
+            return deduped
+        text = str(value).strip()
+        return [text] if text else []
+
+
+class CommentVectorMetadata(CommentClassification):
+    comment_id: str = Field(min_length=3, max_length=32, pattern=r"^C-\d+$")
+    ticket_id: str = Field(min_length=3, max_length=32, pattern=r"^T-\d+$")
+
+
+class CommentMetadataFilters(AppModel):
+    ticket_ids: list[int] = Field(default_factory=list, max_length=50)
+    comment_ids: list[int] = Field(default_factory=list, max_length=50)
+    tags: list[CommentTag] = Field(default_factory=list, max_length=6)
+    references_tickets: list[str] = Field(default_factory=list, max_length=30)
+    references_systems: list[str] = Field(default_factory=list, max_length=30)
+    references_people: list[str] = Field(default_factory=list, max_length=30)
+    author_user_ids: list[int] = Field(default_factory=list, max_length=50)
+    parent_comment_ids: list[int] = Field(default_factory=list, max_length=50)
+    min_signal_strength: Confidence | None = None
+    max_signal_strength: Confidence | None = None
+
+    @field_validator(
+        "references_tickets",
+        "references_systems",
+        "references_people",
+        mode="before",
+    )
+    @classmethod
+    def normalize_filter_reference_values(cls, value: object) -> object:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return [cleaned] if cleaned else []
+        if isinstance(value, list):
+            deduped: list[str] = []
+            seen: set[str] = set()
+            for item in value:
+                text = str(item).strip()
+                if not text:
+                    continue
+                key = text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(text)
+            return deduped
+        text = str(value).strip()
+        return [text] if text else []
+
+    @model_validator(mode="after")
+    def validate_signal_range(self) -> CommentMetadataFilters:
+        if (
+            self.min_signal_strength is not None
+            and self.max_signal_strength is not None
+            and self.min_signal_strength > self.max_signal_strength
+        ):
+            raise ValueError(
+                "min_signal_strength must be less than or equal to max_signal_strength"
+            )
+        return self
+
+
+_COMMENT_FILTER_KEYS = {
+    "ticket_ids",
+    "comment_ids",
+    "tags",
+    "references_tickets",
+    "references_systems",
+    "references_people",
+    "author_user_ids",
+    "parent_comment_ids",
+    "min_signal_strength",
+    "max_signal_strength",
+}
+
+
+class TicketCommentRetrieverInput(AppModel):
+    query: str = Field(min_length=1, max_length=1200)
+    metadata_filters: CommentMetadataFilters | None = None
+    limit: int = Field(default=8, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def hoist_filter_keys(cls, values: object) -> object:
+        """Allow LLMs to pass CommentMetadataFilters fields at the top level.
+
+        The LLM sometimes sends e.g. ``ticket_ids=[1, 2]`` directly instead of
+        nesting it under ``metadata_filters``.  This validator moves any such
+        keys into ``metadata_filters`` so the call still validates correctly.
+        """
+        if not isinstance(values, dict):
+            return values
+        extra = {k: v for k, v in values.items() if k in _COMMENT_FILTER_KEYS}
+        if not extra:
+            return values
+        values = {k: v for k, v in values.items() if k not in _COMMENT_FILTER_KEYS}
+        existing = values.get("metadata_filters")
+        if isinstance(existing, dict):
+            merged = {**extra, **existing}  # explicit metadata_filters wins
+        elif existing is None:
+            merged = extra
+        else:
+            return {**values, **{"metadata_filters": existing}}
+        values["metadata_filters"] = merged
+        return values
+
+    @field_validator("metadata_filters", mode="before")
+    @classmethod
+    def coerce_metadata_filters(cls, value: object) -> object:
+        if value is None or isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            import json
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+            return None
+        return value
+
+
 class ChatTurnResult(AppModel):
     thread_id: str = Field(min_length=1, max_length=120)
     response: str = Field(min_length=1, max_length=4_000)
     route: Literal["follow_up", "self_resolution", "ticket_created", "blocked"]
     ticket_id: int | None = None
     linked_kb_articles: list[KBArticleRef] = Field(default_factory=list, max_length=10)
+    agent_response: AgentResponse | None = None
 
 
 def append_chat_messages(
@@ -320,3 +526,24 @@ class HelpdeskGraphState(TypedDict, total=False):
     ticket: TicketRead
     final_response: ChatTurnResult
     route: str
+
+
+# ── Chart / structured agent response ─────────────────────────────────────────
+
+
+class ChartConfiguration(BaseModel):
+    """Describes a chart to be rendered by the frontend."""
+
+    chart_type: Literal["line", "bar"]
+    title: str
+    data: list[dict[str, Any]]
+    x_axis_key: str
+    data_keys: list[str]
+    colors: list[str] | None = None
+
+
+class AgentResponse(BaseModel):
+    """Top-level structured response returned by the analytics agent."""
+
+    markdown_text: str | None = None
+    chart: ChartConfiguration | None = None

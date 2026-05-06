@@ -1,0 +1,20 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE kb_project_links (
+	id INTEGER NOT NULL, 
+	kb_id VARCHAR(255) NOT NULL, 
+	project_id INTEGER NOT NULL, 
+	PRIMARY KEY (id), 
+	CONSTRAINT uq_kb_project UNIQUE (kb_id, project_id), 
+	FOREIGN KEY(project_id) REFERENCES projects (id) ON DELETE CASCADE
+)
+
+Column Details:
+-- id: Primary key for KB-project link row.
+-- kb_id: Knowledge-base document identifier.
+-- project_id: Foreign key to projects.id.
+
+HINTS: 
+To join 'kb_project_links' and 'projects', use kb_project_links.project_id = projects.id

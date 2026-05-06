@@ -1,0 +1,23 @@
+-------------------------------------------------- 
+manifest update time: 2026-04-28 21:27:04.372262
+ingested time: 2026-04-28 21:27:04.372262
+-------------------------------------------------- 
+CREATE TABLE chat_messages (
+	id INTEGER NOT NULL, 
+	user_id VARCHAR(120) NOT NULL, 
+	thread_id VARCHAR(120) NOT NULL, 
+	role VARCHAR(40) NOT NULL, 
+	content TEXT NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	PRIMARY KEY (id)
+)
+
+Column Details:
+-- id: Primary key for the chat message row.
+-- user_id: Application user identifier for the chat thread.
+-- thread_id: Conversation thread identifier.
+-- role: Message author role. Available options: user, assistant, system.
+-- content: Raw chat message content.
+-- created_at: UTC timestamp when the chat message was stored.
+
+HINTS: 

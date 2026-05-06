@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import re
@@ -19,7 +20,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.db import SessionLocal, TagRecord, create_tickets, init_db, list_tickets  # noqa: E402
+from app.comment_vector import get_comment_vectorstore, upsert_comment_vector_entry  # noqa: E402
+from app.db import (  # noqa: E402
+    ProjectRecord,
+    SessionLocal,
+    TagRecord,
+    TicketCommentRecord,
+    UserRecord,
+    create_tickets,
+    init_db,
+    list_tickets,
+)
 from app.schemas import (  # noqa: E402
     ChatMessage,
     Environment,
@@ -30,86 +41,51 @@ from app.schemas import (  # noqa: E402
     TicketIntelligence,
     TicketStatus,
     UserClearance,
+    UserRole,
 )
 from app.ticket_vector import DEFAULT_TICKET_INDEX_NAME, index_tickets  # noqa: E402
 
 MAX_SUMMARY_CHARS = 1_200
 MAX_MESSAGE_CHARS = 8_000
+MAX_COMMENT_CHARS = 4_000
 DEFAULT_IMPORT_USER = "csv-import"
 DEFAULT_CONFIDENCE = 0.75
+DEMO_USER_PASSWORD_HASH = "csv-import-disabled"
 
 COLUMN_ALIASES = {
-    "summary": ("summary", "title_clean", "title", "subject", "issue", "problem"),
-    "description": (
-        "description_clean",
-        "description",
-        "embedding_text",
-        "details",
-        "body",
-        "message",
-        "request",
-        "issue",
-        "problem",
-    ),
-    "user_id": ("user_id", "requester", "requester_id", "created_by", "email", "user"),
-    "thread_id": (
-        "thread_id",
-        "conversation_id",
-        "session_id",
-        "ticket_id",
-        "ticket_number",
-        "unified_id",
-        "external_record_id",
-        "import_id",
-        "id",
-    ),
+    "summary": ("summary", "title_clean", "title", "subject"),
+    "description": ("description_clean", "description", "embedding_text", "details", "body"),
+    "user_id": ("user_id", "requester", "email"),
+    "thread_id": ("thread_id", "ticket_id", "ticket_number", "id"),
     "status": ("status", "state"),
     "category": ("category", "issue_type", "type"),
     "priority": ("priority", "severity"),
-    "app_name": ("app_name", "component", "application", "app", "system", "service"),
+    "app_name": ("app_name", "component", "application"),
     "environment": ("environment", "env"),
-    "keywords": ("keywords", "keyword", "error_codes", "error_code"),
-    "tags": ("tags", "tag_slugs", "tag"),
-    "confidence": ("confidence", "quality_score", "quality"),
+    "keywords": ("keywords", "error_codes"),
+    "tags": ("tags", "tag_slugs"),
+    "confidence": ("confidence", "quality_score"),
     "project_id": ("project_id",),
+    "project_name": ("project_name", "project"),
+    "project_slug": ("project_slug",),
     "user_clearance": ("user_clearance", "clearance"),
-    "conversation": ("conversation", "messages", "chat_history"),
-    "assistant_reply": (
-        "assistant_reply",
-        "assistant_response",
-        "response",
-        "resolution_clean",
-        "resolution",
-    ),
-    "suggested_fixes": ("suggested_fixes", "fixes", "resolution_steps", "resolution_clean"),
-    "duplicate_ticket_ids": ("duplicate_ticket_ids", "duplicates", "related_ticket_ids"),
-    "created_at": ("created_at", "created", "opened_at", "opened"),
-    "updated_at": ("updated_at", "updated", "last_updated", "modified_at"),
+    "requester_name": ("requester_name", "display_name"),
+    "conversation": ("conversation", "messages"),
+    "comments": ("comments", "ticket_comments"),
+    "assistant_reply": ("assistant_reply", "resolution_clean", "resolution"),
+    "suggested_fixes": ("suggested_fixes", "resolution_steps"),
+    "duplicate_ticket_ids": ("duplicate_ticket_ids", "duplicates"),
+    "created_at": ("created_at", "created", "opened_at"),
+    "updated_at": ("updated_at", "updated", "modified_at"),
     "embedding_text": ("embedding_text",),
     "issue_type": ("issue_type",),
     "error_codes": ("error_codes", "error_code"),
 }
 
 STOPWORDS = {
-    "about",
-    "access",
-    "after",
-    "again",
-    "and",
-    "are",
-    "cannot",
-    "for",
-    "from",
-    "have",
-    "help",
-    "into",
-    "need",
-    "not",
-    "request",
-    "the",
-    "this",
-    "ticket",
-    "with",
+    "about", "access", "after", "again", "and", "are", "cannot",
+    "for", "from", "have", "help", "into", "need", "not",
+    "request", "the", "this", "ticket", "with",
 }
 
 
@@ -117,81 +93,32 @@ STOPWORDS = {
 class ImportReport:
     csv_path: Path
     created_ticket_ids: list[int] = field(default_factory=list)
+    created_comment_ids: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     index_errors: list[str] = field(default_factory=list)
-    dry_run_rows: int = 0
     indexed: int = 0
+    comment_indexed: int = 0
+    dry_run_rows: int = 0
 
     @property
     def created(self) -> int:
         return len(self.created_ticket_ids)
 
+    @property
+    def comments_created(self) -> int:
+        return len(self.created_comment_ids)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--csv",
-        type=Path,
-        help=(
-            "Import ticket rows from a CSV file. Supports the export columns "
-            "ticket id, title clean, description clean, component, issue type, "
-            "severity, status, resolution clean, error codes, and embedding text."
-        ),
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Maximum number of tickets to import. Omit (or pass 0) to import all.",
-    )
-    parser.add_argument(
-        "--start-record",
-        type=int,
-        default=1,
-        help="First data record to import, counting the first CSV data row as 1.",
-    )
-    parser.add_argument(
-        "--end-record",
-        type=int,
-        help="Last data record to import, inclusive. Omit to import through the file end.",
-    )
-    parser.add_argument(
-        "--db-batch-size",
-        type=int,
-        default=500,
-        help="Number of CSV tickets to insert per database commit.",
-    )
-    parser.add_argument(
-        "--vector-batch-size",
-        type=int,
-        default=100,
-        help="Number of imported tickets to send per vector-store embedding/upsert batch.",
-    )
-    parser.add_argument(
-        "--no-reset",
-        action="store_true",
-        help="Append/upsert into the existing ticket index instead of clearing it first.",
-    )
-    parser.add_argument(
-        "--reindex",
-        action="store_true",
-        help="After CSV import, rebuild/upsert the ticket vector index from database tickets.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate CSV rows without writing to the database or Pinecone.",
-    )
-    parser.add_argument(
-        "--skip-vector-index",
-        action="store_true",
-        help="Write CSV rows to SQLite only; skip ticket vector indexing.",
-    )
-    parser.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        help="Keep importing valid rows when one CSV row is invalid.",
-    )
+    parser.add_argument("--csv", type=Path, help="Import ticket rows from a CSV file.")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of tickets to reindex.")
+    parser.add_argument("--db-batch-size", type=int, default=500, help="Tickets per database commit.")
+    parser.add_argument("--vector-batch-size", type=int, default=100, help="Tickets per vector upsert batch.")
+    parser.add_argument("--reindex", action="store_true", help="Rebuild the ticket vector index after import.")
+    parser.add_argument("--dry-run", action="store_true", help="Validate CSV rows without writing.")
+    parser.add_argument("--skip-vector-index", action="store_true", help="Skip ticket vector indexing.")
+    parser.add_argument("--reset-vector-index", action="store_true", help="Clear ticket and comment vector indexes before import.")
     return parser.parse_args()
 
 
@@ -199,13 +126,13 @@ def main() -> None:
     args = parse_args()
     init_db()
 
+    if getattr(args, "reset_vector_index", False):
+        reset_vector_indexes()
+
     if args.csv:
         report = import_csv_tickets(
             args.csv,
             dry_run=args.dry_run,
-            continue_on_error=args.continue_on_error,
-            start_record=args.start_record,
-            end_record=args.end_record,
             db_batch_size=args.db_batch_size,
             vector_batch_size=args.vector_batch_size,
             index_vectors=not args.skip_vector_index,
@@ -214,19 +141,13 @@ def main() -> None:
         if args.dry_run or not args.reindex:
             return
 
-    count = reindex_ticket_vectors(
-        limit=args.limit,
-        reset=not args.no_reset,
-        batch_size=args.vector_batch_size,
-    )
+    count = reindex_ticket_vectors(limit=args.limit, batch_size=args.vector_batch_size)
     print(
-        "\n".join(
-            [
-                "Tickets indexed.",
-                f"index_name: {DEFAULT_TICKET_INDEX_NAME}",
-                f"tickets: {count}",
-            ]
-        )
+        "\n".join([
+            "Tickets indexed.",
+            f"index_name: {DEFAULT_TICKET_INDEX_NAME}",
+            f"tickets: {count}",
+        ])
     )
 
 
@@ -234,19 +155,12 @@ def import_csv_tickets(
     csv_path: Path,
     *,
     dry_run: bool = False,
-    continue_on_error: bool = False,
-    start_record: int = 1,
-    end_record: int | None = None,
     db_batch_size: int = 500,
     vector_batch_size: int = 100,
     index_vectors: bool = True,
 ) -> ImportReport:
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
-    if start_record < 1:
-        raise ValueError("--start-record must be 1 or greater")
-    if end_record is not None and end_record < start_record:
-        raise ValueError("--end-record must be greater than or equal to --start-record")
 
     report = ImportReport(csv_path=csv_path)
     pending: list[TicketCreate] = []
@@ -256,14 +170,7 @@ def import_csv_tickets(
             raise ValueError("CSV file must contain a header row.")
 
         with SessionLocal() as db:
-            for record_number, row in enumerate(reader, start=1):
-                if record_number < start_record:
-                    continue
-                if end_record is not None and record_number > end_record:
-                    break
-
-                row_number = record_number + 1
-                persisting_batch = False
+            for row_number, row in enumerate(reader, start=2):
                 try:
                     ticket = ticket_from_csv_row(row, row_number=row_number)
                     if dry_run:
@@ -271,31 +178,16 @@ def import_csv_tickets(
                         continue
 
                     pending.append(ticket)
-                    if len(pending) >= max(db_batch_size, 1):
-                        persisting_batch = True
-                        persist_ticket_batch(
-                            db,
-                            pending,
-                            report,
-                            index_vectors=index_vectors,
-                            vector_batch_size=vector_batch_size,
-                        )
+                    if len(pending) >= db_batch_size:
+                        persist_ticket_batch(db, pending, report, index_vectors=index_vectors, vector_batch_size=vector_batch_size)
                         pending = []
                 except Exception as exc:
                     message = f"row {row_number}: {exc}"
                     report.errors.append(message)
-                    if persisting_batch:
-                        pending = []
-                    if not continue_on_error:
-                        raise ValueError(message) from exc
+                    raise ValueError(message) from exc
+
             if pending:
-                persist_ticket_batch(
-                    db,
-                    pending,
-                    report,
-                    index_vectors=index_vectors,
-                    vector_batch_size=vector_batch_size,
-                )
+                persist_ticket_batch(db, pending, report, index_vectors=index_vectors, vector_batch_size=vector_batch_size)
     return report
 
 
@@ -308,12 +200,15 @@ def persist_ticket_batch(
     vector_batch_size: int,
 ) -> None:
     try:
+        tickets = prepare_ticket_batch(db, tickets)
         ensure_tag_slugs(db, [slug for ticket in tickets for slug in ticket.tag_slugs])
         created = create_tickets(db, tickets, index_vectors=False)
+        comment_refs = create_imported_comments(db, created, report)
     except Exception:
         db.rollback()
         raise
     report.created_ticket_ids.extend(ticket.id for ticket in created)
+    index_imported_comments(comment_refs, report)
     if not index_vectors:
         return
     try:
@@ -322,10 +217,23 @@ def persist_ticket_batch(
         report.index_errors.append(str(exc))
 
 
-def reindex_ticket_vectors(*, limit: int, reset: bool, batch_size: int) -> int:
+def reset_vector_indexes() -> None:
+    try:
+        index_tickets([], reset=True)
+        print("Ticket vector index cleared.")
+    except Exception as exc:
+        print(f"[warn] Ticket vector index reset failed: {exc}", file=sys.stderr)
+    try:
+        get_comment_vectorstore().delete(delete_all=True)
+        print("Comment vector index cleared.")
+    except Exception as exc:
+        print(f"[warn] Comment vector index reset failed: {exc}", file=sys.stderr)
+
+
+def reindex_ticket_vectors(*, limit: int, batch_size: int) -> int:
     with SessionLocal() as db:
         tickets = list_tickets(db, None, limit=limit)
-    return index_tickets(tickets, reset=reset, batch_size=batch_size)
+    return index_tickets(tickets, reset=True, batch_size=batch_size)
 
 
 def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCreate:
@@ -335,6 +243,7 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
 
     embedding_text = clean_text(first_value(values, "embedding_text"))
     description = clean_text(first_value(values, "description"))
+    comments = parse_comments(first_value(values, "comments"))
     vector_description = embedding_text or description
     summary = clean_text(first_value(values, "summary")) or first_sentence(vector_description)
     if not summary:
@@ -344,18 +253,13 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
     issue_type = clean_text(first_value(values, "issue_type"))
     category_text = first_value(values, "category")
     keywords = parse_list(first_value(values, "keywords"))
-    keywords.extend(parse_list(first_value(values, "error_codes")))
     keywords.extend(value for value in [app_name, issue_type] if value)
     if not keywords:
         keywords = infer_keywords(" ".join([summary, vector_description, category_text]))
 
     tags = [slugify(value) for value in parse_list(first_value(values, "tags"))]
     if not tags:
-        tags = [
-            slugify(value)
-            for value in [category_text, issue_type, app_name]
-            if clean_text(value)
-        ]
+        tags = [slugify(value) for value in [category_text, issue_type, app_name] if clean_text(value)]
     tags = [tag for tag in tags if tag]
 
     conversation = parse_conversation(first_value(values, "conversation"))
@@ -405,6 +309,10 @@ def ticket_from_csv_row(row: Mapping[str, Any], *, row_number: int) -> TicketCre
             "embedding_text": embedding_text,
             "issue_type": issue_type,
             "error_codes": parse_list(first_value(values, "error_codes")),
+            "project_name": clean_text(first_value(values, "project_name")),
+            "project_slug": slugify(first_value(values, "project_slug")),
+            "requester_name": clean_text(first_value(values, "requester_name")),
+            "csv_comments": comments,
             "csv": {str(key): value for key, value in row.items()},
         },
         created_at=created_at,
@@ -418,18 +326,142 @@ def print_import_report(report: ImportReport) -> None:
         f"csv_path: {report.csv_path}",
         f"created: {report.created}",
         f"indexed: {report.indexed}",
+        f"comments_created: {report.comments_created}",
+        f"comments_indexed: {report.comment_indexed}",
         f"dry_run_rows: {report.dry_run_rows}",
         f"errors: {len(report.errors)}",
         f"index_errors: {len(report.index_errors)}",
     ]
     if report.created_ticket_ids:
-        shown_ids = ", ".join(str(ticket_id) for ticket_id in report.created_ticket_ids[:20])
+        shown_ids = ", ".join(str(tid) for tid in report.created_ticket_ids[:20])
         lines.append(f"ticket_ids: {shown_ids}")
     if report.errors:
         lines.extend(report.errors[:10])
     if report.index_errors:
-        lines.extend(f"index error: {error}" for error in report.index_errors[:3])
+        lines.extend(f"index error: {error}" for error in report.index_errors[:5])
     print("\n".join(lines))
+
+
+def prepare_ticket_batch(db, tickets: Sequence[TicketCreate]) -> list[TicketCreate]:
+    prepared: list[TicketCreate] = []
+    for ticket in tickets:
+        raw_context = dict(ticket.raw_context or {})
+        ensure_user(
+            db,
+            email=ticket.user_id,
+            display_name=clean_text(raw_context.get("requester_name")),
+            role=UserRole.USER.value,
+            clearance=ticket.user_clearance.value,
+        )
+        project_id = ticket.project_id or ensure_project(db, raw_context)
+        prepared.append(ticket.model_copy(update={"project_id": project_id}))
+    return prepared
+
+
+def ensure_project(db, raw_context: Mapping[str, Any]) -> int | None:
+    project_name = clean_text(raw_context.get("project_name"))
+    project_slug = slugify(clean_text(raw_context.get("project_slug")) or project_name)
+    if not project_name and not project_slug:
+        return None
+    if not project_name:
+        project_name = project_slug.replace("-", " ").title()
+
+    existing = db.scalars(select(ProjectRecord).where(ProjectRecord.slug == project_slug)).first()
+    if existing:
+        return existing.id
+
+    owner = ensure_user(
+        db,
+        email="billing.demo.owner@its.local",
+        display_name="Billing Demo Owner",
+        role=UserRole.ADMIN.value,
+        clearance=UserClearance.RESTRICTED.value,
+    )
+    record = ProjectRecord(
+        name=project_name,
+        slug=project_slug,
+        description=f"Demo project for {project_name}.",
+        owner_id=owner.id,
+    )
+    db.add(record)
+    db.flush()
+    return record.id
+
+
+def ensure_user(
+    db,
+    *,
+    email: str,
+    display_name: str = "",
+    role: str = UserRole.USER.value,
+    clearance: str = UserClearance.PUBLIC.value,
+) -> UserRecord:
+    clean_email = clean_text(email).casefold()
+    if "@" not in clean_email:
+        clean_email = f"{slugify(clean_email or DEFAULT_IMPORT_USER)}@demo.local"
+    existing = db.scalars(select(UserRecord).where(UserRecord.email == clean_email)).first()
+    if existing:
+        return existing
+
+    record = UserRecord(
+        email=clean_email,
+        display_name=(
+            clean_text(display_name)
+            or clean_email.split("@", 1)[0].replace(".", " ").title()
+        ),
+        hashed_password=DEMO_USER_PASSWORD_HASH,
+        role=role,
+        clearance=clearance,
+    )
+    db.add(record)
+    db.flush()
+    return record
+
+
+def create_imported_comments(db, tickets, report: ImportReport) -> list[tuple[int, int]]:
+    refs: list[tuple[int, int]] = []
+    for ticket in tickets:
+        raw_comments = ticket.raw_context.get("csv_comments") or []
+        if not isinstance(raw_comments, list):
+            continue
+        for item in raw_comments:
+            if not isinstance(item, Mapping):
+                continue
+            content = clean_text(item.get("content"))
+            if not content:
+                continue
+            author = ensure_user(
+                db,
+                email=clean_text(item.get("author_email")) or "billing.demo.agent@its.local",
+                display_name=clean_text(item.get("author_name")) or "Billing Demo Agent",
+                role=clean_text(item.get("author_role")) or UserRole.AGENT.value,
+                clearance=clean_text(item.get("clearance")) or ticket.user_clearance.value,
+            )
+            created_at = parse_datetime(clean_text(item.get("created_at"))) or ticket.updated_at or datetime.now(UTC)
+            updated_at = parse_datetime(clean_text(item.get("updated_at"))) or created_at
+            record = TicketCommentRecord(
+                ticket_id=ticket.id,
+                author_user_id=author.id,
+                content=truncate(content, MAX_COMMENT_CHARS),
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+            db.add(record)
+            db.flush()
+            report.created_comment_ids.append(record.id)
+            refs.append((ticket.id, record.id))
+    if refs:
+        db.commit()
+    return refs
+
+
+def index_imported_comments(comment_refs: Sequence[tuple[int, int]], report: ImportReport) -> None:
+    for ticket_id, comment_id in comment_refs:
+        try:
+            if asyncio.run(upsert_comment_vector_entry(ticket_id, comment_id)):
+                report.comment_indexed += 1
+        except Exception as exc:
+            report.index_errors.append(f"ticket {ticket_id} comment {comment_id}: {exc}")
 
 
 def ensure_tag_slugs(db, slugs: Sequence[str]) -> None:
@@ -480,7 +512,6 @@ def parse_status(value: str) -> TicketStatus:
 def parse_category(value: str) -> TicketCategory:
     if not value:
         return TicketCategory.INFRA
-
     try:
         return parse_enum(
             TicketCategory,
@@ -518,17 +549,13 @@ def parse_priority(value: str) -> Priority:
         Priority.MEDIUM,
         {
             "p0": Priority.CRITICAL,
-            "1": Priority.CRITICAL,
             "p1": Priority.CRITICAL,
             "urgent": Priority.CRITICAL,
-            "2": Priority.HIGH,
             "p2": Priority.HIGH,
             "major": Priority.HIGH,
-            "3": Priority.MEDIUM,
             "p3": Priority.MEDIUM,
             "med": Priority.MEDIUM,
             "normal": Priority.MEDIUM,
-            "4": Priority.LOW,
             "p4": Priority.LOW,
             "minor": Priority.LOW,
         },
@@ -576,12 +603,6 @@ def parse_enum(enum_type, value: str, default, aliases: Mapping[str, Any]):
     for member in enum_type:
         if normalized in {compact(member.name), compact(member.value)}:
             return member
-    for part in re.split(r"[/,|>]", value):
-        if part.strip() and part.strip() != value.strip():
-            try:
-                return parse_enum(enum_type, part, default, aliases)
-            except ValueError:
-                pass
     allowed = ", ".join(member.value for member in enum_type)
     raise ValueError(f"invalid {enum_type.__name__} {value!r}; expected one of: {allowed}")
 
@@ -592,11 +613,9 @@ def parse_conversation(value: str) -> list[ChatMessage]:
     parsed = parse_json(value)
     if parsed is None:
         return [ChatMessage(role="user", content=truncate(value, MAX_MESSAGE_CHARS))]
-    if isinstance(parsed, str):
-        return [ChatMessage(role="user", content=truncate(parsed, MAX_MESSAGE_CHARS))]
     if isinstance(parsed, Mapping):
         parsed = [parsed]
-    if not isinstance(parsed, Sequence):
+    if not isinstance(parsed, list):
         return []
 
     messages: list[ChatMessage] = []
@@ -619,14 +638,51 @@ def parse_conversation(value: str) -> list[ChatMessage]:
     return messages
 
 
+def parse_comments(value: str) -> list[dict[str, str]]:
+    if not value:
+        return []
+    parsed = parse_json(value)
+    if parsed is None:
+        return [{"content": value.strip()}] if value.strip() else []
+    if isinstance(parsed, (str, Mapping)):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+
+    comments: list[dict[str, str]] = []
+    for item in parsed:
+        if isinstance(item, str):
+            content = clean_text(item)
+            if content:
+                comments.append({"content": truncate(content, MAX_COMMENT_CHARS)})
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        content = clean_text(item.get("content") or item.get("message") or item.get("text"))
+        if not content:
+            continue
+        created_at = clean_text(item.get("created_at"))
+        updated_at = clean_text(item.get("updated_at"))
+        comments.append(
+            {
+                "content": truncate(content, MAX_COMMENT_CHARS),
+                "author_email": clean_text(item.get("author_email") or item.get("email")),
+                "author_name": clean_text(item.get("author_name") or item.get("display_name")),
+                "author_role": clean_text(item.get("author_role") or item.get("role")),
+                "clearance": clean_text(item.get("clearance")),
+                "created_at": parse_datetime(created_at).isoformat() if created_at else "",
+                "updated_at": parse_datetime(updated_at).isoformat() if updated_at else "",
+            }
+        )
+    return comments
+
+
 def parse_list(value: str) -> list[str]:
     if not value:
         return []
     parsed = parse_json(value)
     if isinstance(parsed, list):
         return [clean_text(item) for item in parsed if clean_text(item)]
-    if parsed is not None and not isinstance(parsed, (dict, list)):
-        return [clean_text(parsed)] if clean_text(parsed) else []
     parts = re.split(r"[,;|]", value)
     return [part.strip() for part in parts if part.strip()]
 
@@ -662,13 +718,12 @@ def parse_datetime(value: str) -> datetime | None:
     text = value.strip()
     if text.endswith("Z"):
         text = f"{text[:-1]}+00:00"
-    for candidate in (text, text.replace("/", "-")):
-        try:
-            parsed = datetime.fromisoformat(candidate)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-        except ValueError:
-            pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%m/%d/%Y %H:%M"):
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=UTC)
         except ValueError:
@@ -678,7 +733,7 @@ def parse_datetime(value: str) -> datetime | None:
 
 def parse_json(value: str) -> Any | None:
     text = value.strip()
-    if not text or text[0] not in "[{\"":
+    if not text or text[0] not in '[{"':
         return None
     try:
         return json.loads(text)
@@ -696,9 +751,7 @@ def first_sentence(value: str) -> str:
     if not clean:
         return ""
     match = re.search(r"(?<=[.!?])\s+", clean)
-    if not match:
-        return clean
-    return clean[: match.start()].strip()
+    return clean[: match.start()].strip() if match else clean
 
 
 def dedupe(values: Sequence[str] | Any) -> list[str]:
