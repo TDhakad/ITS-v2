@@ -68,11 +68,13 @@ jobs:
       # BEGIN - Docker auth and build
       #
       # If you already have a container image, you can omit these steps.
-      - name: 'Docker Auth'
+      - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
-        run: |-
-          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          
       - name: 'Build and Push Container'
         run: |-
           DOCKER_TAG="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/its-cloud-run/its:${{ github.sha }}"
