@@ -86,7 +86,7 @@ jobs:
         with:
           service: '${{ env.SERVICE }}'
           region: '${{ env.REGION }}'
-          image: '${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.SERVICE }}:${{ github.sha }}'
+          image: '${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/its-cloud-run:${{ github.sha }}'
           env_vars: |-
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
             LLM_PROVIDER=ollama
