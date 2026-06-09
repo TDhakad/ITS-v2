@@ -33,6 +33,7 @@ on:
   push:
     branches:
       - 'main'
+  workflow_dispatch:
 
 env:
   PROJECT_ID: 'intelligent-ticketing-system' # TODO: update to your Google Cloud project ID
