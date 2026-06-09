@@ -38,7 +38,7 @@ on:
 env:
   PROJECT_ID: 'intelligent-ticketing-system' # TODO: update to your Google Cloud project ID
   REGION: 'us-central1' # TODO: update to your region
-  SERVICE: 'its-cloud-run@intelligent-ticketing-system.iam.gserviceaccount.com' # TODO: update to your service name
+  SERVICE: 'ITS-Cloud-Run' # TODO: update to your service name
   WORKLOAD_IDENTITY_PROVIDER: 'projects/251208443758/locations/global/workloadIdentityPools/github-pool/providers/github-provider' # TODO: update to your workload identity provider
 
 jobs:
