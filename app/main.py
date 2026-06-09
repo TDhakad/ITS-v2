@@ -111,6 +111,7 @@ if _settings.cors_allowed_origins:
         allow_headers=["*"],
     )
 
+
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

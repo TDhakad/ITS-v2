@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, inspect, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import select
@@ -249,8 +249,12 @@ def _create_hot_path_indexes(connection: Connection) -> None:
 
 
 def _column_exists(connection: Connection, table_name: str, column_name: str) -> bool:
-    rows = connection.execute(text(f"PRAGMA table_info({table_name})")).mappings()
-    return any(row["name"] == column_name for row in rows)
+    inspector = inspect(connection)
+    try:
+        columns = [col["name"] for col in inspector.get_columns(table_name)]
+        return column_name in columns
+    except Exception:
+        return False
 
 
 MIGRATIONS: tuple[Migration, ...] = (

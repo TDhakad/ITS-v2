@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -70,7 +71,7 @@ class Settings(BaseSettings):
         default=30.0, alias="SQLITE_CONNECT_TIMEOUT", gt=0
     )
     sql_echo: bool = Field(default=False, alias="SQL_ECHO")
-    cors_allowed_origins: list[str] = Field(
+    cors_allowed_origins: Any = Field(
         default_factory=lambda: [
             "http://localhost:3000",
             "http://127.0.0.1:3000",

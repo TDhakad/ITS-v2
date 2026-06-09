@@ -355,13 +355,17 @@ def run_admin_analytics_question(
         graph = _get_analytics_graph()
         state = graph.invoke(
             {"messages": [HumanMessage(content=clean_question)]},
-            config=_analytics_invoke_config(
-                run_name="admin_analytics_graph",
-                project_id=project_id,
-                recursion_limit=16,
-                tags=["analytics", "langgraph", "graph"],
-                path="graph",
-            ),
+            config={
+                "run_name": "admin_analytics_graph",
+                "recursion_limit": 16,
+                "tags": ["analytics", "langgraph", "graph"],
+                "metadata": {
+                    "component": "admin_analytics",
+                    "path": "graph",
+                    "project_scoped": project_id is not None,
+                    **(({"project_id": project_id}) if project_id is not None else {}),
+                },
+            },
         )
         answer = _final_message_text(state.get("messages", []))
         # "grounded" means the graph (or direct path) already fetched real data.
@@ -398,35 +402,8 @@ def run_admin_analytics_question(
         _VECTOR_QUERY_CTX.reset(vector_token)
 
 
-def _analytics_invoke_config(
-    *,
-    run_name: str,
-    project_id: int | None,
-    tags: list[str],
-    path: str,
-    recursion_limit: int | None = None,
-) -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "component": "admin_analytics",
-        "path": path,
-        "project_scoped": project_id is not None,
-    }
-    if project_id is not None:
-        metadata["project_id"] = project_id
-
-    config: dict[str, Any] = {
-        "run_name": run_name,
-        "tags": tags,
-        "metadata": metadata,
-    }
-    if recursion_limit is not None:
-        config["recursion_limit"] = recursion_limit
-    return config
-
-
 def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
     trace["path"] = "sql_agent_fallback"
-    # Inject scope hint so the SQL agent respects the project filter.
     scope = _ANALYTICS_SCOPE.get() or {}
     scoped_question = clean_question
     if scope.get("project_id") is not None:
@@ -435,14 +412,19 @@ def _run_sql_agent_fallback(clean_question: str, trace: dict[str, Any]) -> str:
         )
 
     agent = _get_sql_agent()
+    pid = scope.get("project_id")
     result = agent.invoke(
         {"input": scoped_question},
-        config=_analytics_invoke_config(
-            run_name="admin_analytics_sql_fallback",
-            project_id=scope.get("project_id"),
-            tags=["analytics", "sql-agent", "fallback"],
-            path="sql_fallback",
-        ),
+        config={
+            "run_name": "admin_analytics_sql_fallback",
+            "tags": ["analytics", "sql-agent", "fallback"],
+            "metadata": {
+                "component": "admin_analytics",
+                "path": "sql_fallback",
+                "project_scoped": pid is not None,
+                **(({"project_id": pid}) if pid is not None else {}),
+            },
+        },
     )
 
     output = result.get("output") if isinstance(result, dict) else result
@@ -824,7 +806,7 @@ def list_tickets(
     return _json(
         {
             "filters": filters,
-            "result_count": len(rows),
+            "total_count": len(rows),
             "limit": limit,
             "rows": [
                 {
@@ -1163,7 +1145,6 @@ def _embedding_model_name(settings: Any) -> str:
 
 
 def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
-    # --- 1. Scoping Logic ---
     scope = _ANALYTICS_SCOPE.get() or {}
     scope_instruction = ""
     if scope.get("project_id") is not None:
@@ -1173,22 +1154,14 @@ def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
             f"Never return data from other projects."
         )
 
-    # --- 2. JIT Manifest Loading ---
-    # Fetch paths from state instead of full strings
-    paths = state.get("table_manifests", [])
-
     manifests = []
-    for path in paths:
+    for path in state.get("table_manifests", []):
         try:
             manifests.append(_manifest_text(path))
         except FileNotFoundError:
-            # Handle edge cases gracefully
-            logger.warning(f"Warning: Manifest not found at {path}")
-            continue
+            logger.warning("Manifest not found at %s", path)
 
-    # Combine them into a single string for the prompt
     schemas_context = "\n\n".join(manifests)
-
     prompt = (
         ANALYTICS_GRAPH_PROMPT.replace("{today}", _today_iso()).replace(
             "{schemas_context}", schemas_context
@@ -1196,7 +1169,6 @@ def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
         + scope_instruction
     )
 
-    # --- 3. LLM Invocation ---
     tool_rounds = state.get("tool_rounds", 0)
     llm = (
         get_chat_model().bind_tools(_get_admin_tools())
@@ -1850,11 +1822,6 @@ def _elapsed_ms(started: float) -> int:
 def _contains_pattern(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
-
-
-def _text_query_terms(value: str) -> list[str]:
-    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value)
-    return [term for term in terms[:8] if len(term) > 1]
 
 
 @lru_cache(maxsize=1)
