@@ -63,6 +63,7 @@ jobs:
         with:
           workload_identity_provider: '${{ env.WORKLOAD_IDENTITY_PROVIDER }}'
           service_account: its-cloud-run@intelligent-ticketing-system.iam.gserviceaccount.com
+          token_format: access_token
 
       # BEGIN - Docker auth and build
       #
