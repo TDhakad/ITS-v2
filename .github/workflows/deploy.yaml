@@ -70,7 +70,7 @@ jobs:
       # If you already have a container image, you can omit these steps.
       - name: 'Docker Auth'
         uses: google-github-actions/setup-gcloud@v2
-        run: |
+        run: |-
           gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
       - name: 'Build and Push Container'
