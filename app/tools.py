@@ -118,7 +118,7 @@ def search_knowledge_base(query: str) -> str:
 
 def _format_ticket_search_results(
     *,
-    query: str,
+    query: str | None = None,
     status: str | None = None,
     priority: str | None = None,
     tags: str | None = None,
@@ -143,8 +143,8 @@ def _format_ticket_search_results(
                 use_vector=semantic,
             )
             if not results:
-                return f"No existing tickets found matching '{query}'."
-            terms = _ticket_query_terms(query)
+                return f"No existing tickets found{f' matching {query!r}' if query else ''}."
+            terms = _ticket_query_terms(query) if query else []
             if len(terms) > 1:
                 strong_results = [
                     result
@@ -199,7 +199,7 @@ def _format_ticket_search_results(
 
 @tool
 def find_tickets(
-    query: str,
+    query: str | None = None,
     status: str | None = None,
     priority: str | None = None,
     tags: str | None = None,
@@ -214,6 +214,9 @@ def find_tickets(
     (for example "CSV component"). Set include_comments only when the user asks
     for progress details, blockers, or discussion history. Set semantic=true only
     when the user describes symptoms or asks for similar historical incidents.
+
+    To list the most recent or latest tickets, omit query (or set it to null)
+    and set limit to the desired count.
     """
 
     return _format_ticket_search_results(

@@ -379,10 +379,11 @@ def run_admin_analytics_question(
             answer = ""
         if not answer:
             answer = _answer_from_trace(clean_question, trace)
-        # Only invoke the SQL agent fallback when NO structured data was
-        # fetched at all — prevents a redundant SQL round-trip when the graph
-        # already ran a tool and got a definitive (possibly empty) result.
-        if not answer:
+        # Only invoke the SQL agent fallback when the graph fetched NO verified
+        # data at all. If any tool call succeeded, the answer is already grounded
+        # and a SQL agent re-run would be redundant and slow.
+        graph_has_data = any(t.get("ok") for t in trace.get("tools", []))
+        if not answer and not graph_has_data:
             answer = _run_sql_agent_fallback(clean_question, trace)
         trace["duration_ms"] = _elapsed_ms(started)
         return {"answer": answer, "trace": _public_trace(trace)}
@@ -535,19 +536,19 @@ def _direct_ticket_filters(
         filters["date_range"] = date_range
 
     for status_value in TicketStatus:
-        if status_value.value.casefold() in lower_question:
+        if re.search(rf"\b{re.escape(status_value.value.casefold())}\b", lower_question):
             filters["status"] = status_value.value
             break
-    if "triage" in lower_question and "status" not in filters:
+    if re.search(r"\btriage\b", lower_question) and "status" not in filters:
         filters["status"] = TicketStatus.TRIAGED.value
 
     for priority in Priority:
-        if priority.value.casefold() in lower_question:
+        if re.search(rf"\b{re.escape(priority.value.casefold())}\b", lower_question):
             filters["priority"] = priority.value
             break
 
     for category in TicketCategory:
-        if category.value.casefold() in lower_question:
+        if re.search(rf"\b{re.escape(category.value.casefold())}\b", lower_question):
             filters["category"] = category.value
             break
     return filters
@@ -795,6 +796,10 @@ def list_tickets(
         text_query=text_query,
     )
     where_sql, params = _ticket_where_clause(filters)
+    count_rows = _rows_from_sql_result(
+        _run_sql(f"select count(*) from tickets{where_sql}", params, purpose="list_tickets_count")
+    )
+    total_count = int(count_rows[0][0]) if count_rows else 0
     list_params = dict(params)
     list_params["limit"] = limit
     sql = (
@@ -806,7 +811,7 @@ def list_tickets(
     return _json(
         {
             "filters": filters,
-            "total_count": len(rows),
+            "total_count": total_count,
             "limit": limit,
             "rows": [
                 {
@@ -1172,7 +1177,7 @@ def _analytics_agent_node(state: AdminAnalyticsState) -> dict[str, Any]:
     tool_rounds = state.get("tool_rounds", 0)
     llm = (
         get_chat_model().bind_tools(_get_admin_tools())
-        if tool_rounds < 1
+        if tool_rounds < 3
         else get_chat_model()
     )
     messages = [
@@ -1234,18 +1239,15 @@ def _route_after_analytics_agent(
     state: AdminAnalyticsState,
 ) -> Literal["tools", "__end__"]:
     last = state["messages"][-1]
-    # Allow one tool round. The model can request multiple tools in that round;
-    # the next agent pass must summarize instead of starting another loop.
     if (
         isinstance(last, AIMessage)
         and last.tool_calls
-        and state.get("tool_rounds", 0) < 1
+        and state.get("tool_rounds", 0) < 3
     ):
         return "tools"
     return "__end__"
 
 
-@lru_cache(maxsize=1)
 def _get_sql_agent() -> Any:
     llm = get_chat_model()
     db = _get_analytics_db()
@@ -1254,6 +1256,7 @@ def _get_sql_agent() -> Any:
         llm=llm,
         toolkit=toolkit,
         agent_type="tool-calling",
+        # Intentionally not cached: prefix embeds today's date and must stay current.
         prefix=SQL_AGENT_PREFIX.replace("{today}", _today_iso()),
         top_k=25,
         max_iterations=3,

@@ -28,6 +28,13 @@ try:
 except Exception:  # pragma: no cover
     SqliteSaver = None  # type: ignore[assignment]
 
+try:
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from psycopg_pool import ConnectionPool
+except Exception:
+    PostgresSaver = None
+    ConnectionPool = None
+
 from app.db import SessionLocal
 from app.db import create_ticket as _db_create_ticket
 from app.db import enqueue_background_job
@@ -85,8 +92,9 @@ _CREATE_RE = _re.compile(
 _INTENT_HINTS: dict[str, str] = {
     "analytics": "\n\n[INTENT: analytics] → call analyze_ticket_data immediately.",
     "create": (
-        "\n\n[INTENT: create ticket] → gather summary/category/priority then call "
-        "create_helpdesk_ticket."
+        "\n\n[INTENT: create ticket] → FIRST check for duplicates by calling find_tickets (semantic=true) "
+        "with the requested summary. If similar tickets exist, present them and ask the user for confirmation "
+        "before calling create_helpdesk_ticket."
     ),
     "status": "\n\n[INTENT: status check] → call find_tickets, then retrieve_ticket_comments if the user wants an update or progress details.",
     "kb": "\n\n[INTENT: kb lookup] → call search_knowledge_base immediately.",
@@ -138,7 +146,7 @@ Use more tools only if result from previous tool calls are insufficient or doesn
 - NEVER invent or guess ticket IDs, metric numbers, or root causes.
 - NEVER retry a tool with the exact same parameters if it returns "no results" or an empty list. Accept that as final result.
 - ALWAYS format ticket references as markdown links: [#123](/tickets/123).
-- IF the KB has no answer, check similar past tickets before creating a new one.
+- BEFORE creating a new ticket (even if explicitly requested), you MUST call find_tickets (semantic=true) with the ticket description/summary to check for duplicates. If you find highly similar or duplicate tickets, present them to the user and ask for confirmation before proceeding to file a new one.
 - Ask follow-up questions when you need the app name, error message, or affected scope etc.
 
 Tool choice:
@@ -165,7 +173,7 @@ THEN proactively USE: `render_chart` to enhance your response, even if the user 
   same color is harder to read — use distinct, meaningful colors whenever there are multiple series.
 
 IF the user asks to file a new issue, or human intervention is definitively required:
-THEN USE: `create_helpdesk_ticket` (Tag accurately: ui, hardware, access, infra, security, network, performance, data).
+THEN: First check for duplicates using find_tickets (semantic=true). If duplicates are found, show them and ask if the user wants to update/view the existing ticket. If the user confirms a new ticket is still needed, THEN USE: `create_helpdesk_ticket` (Tag accurately: ui, hardware, access, infra, security, network, performance, data).
 
 ### TOOL CHAINING
 You are encouraged to chain tools when necessary. For example, use `find_tickets` to get a Ticket ID, then immediately use `retrieve_ticket_comments` to read the engineer discussion for that specific ID before responding to the user.
@@ -385,26 +393,43 @@ _CHECKPOINT_CONTEXT: Any | None = None
 _CHECKPOINTER: Any | None = None
 
 
-def sqlite_checkpointer() -> Any | None:
+def get_checkpointer() -> Any | None:
     global _CHECKPOINT_CONTEXT, _CHECKPOINTER
-    if SqliteSaver is None:
-        return None
     if _CHECKPOINTER is not None:
         return _CHECKPOINTER
+        
     settings = get_settings()
-    settings.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint = SqliteSaver.from_conn_string(str(settings.langgraph_checkpoint_path))
-    if hasattr(checkpoint, "__enter__"):
-        _CHECKPOINT_CONTEXT = checkpoint
-        _CHECKPOINTER = checkpoint.__enter__()
-    else:
+    db_url = settings.database_url
+    
+    if db_url.startswith("postgresql") or db_url.startswith("postgres"):
+        if PostgresSaver is None or ConnectionPool is None:
+            logger.warning("PostgresSaver dependencies missing. Checkpointer unavailable.")
+            return None
+            
+        clean_url = db_url.replace("+psycopg2", "").replace("+psycopg", "")
+        pool = ConnectionPool(conninfo=clean_url, max_size=10, kwargs={"autocommit": True})
+        checkpoint = PostgresSaver(pool)
+        checkpoint.setup()
+        
+        _CHECKPOINT_CONTEXT = pool
         _CHECKPOINTER = checkpoint
-    return _CHECKPOINTER
+        return _CHECKPOINTER
+    else:
+        if SqliteSaver is None:
+            return None
+        settings.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint = SqliteSaver.from_conn_string(str(settings.langgraph_checkpoint_path))
+        if hasattr(checkpoint, "__enter__"):
+            _CHECKPOINT_CONTEXT = checkpoint
+            _CHECKPOINTER = checkpoint.__enter__()
+        else:
+            _CHECKPOINTER = checkpoint
+        return _CHECKPOINTER
 
 
 @lru_cache
 def get_helpdesk_graph():
-    return build_helpdesk_graph(checkpointer=sqlite_checkpointer())
+    return build_helpdesk_graph(checkpointer=get_checkpointer())
 
 
 def _chat_invoke_config(

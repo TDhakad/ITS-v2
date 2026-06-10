@@ -1374,7 +1374,7 @@ def save_ticket_insight(
 
 def search_tickets(
     db: Session,
-    query: str,
+    query: str | None = None,
     *,
     user_id: str | None = None,
     project_id: int | None = None,
@@ -1388,9 +1388,49 @@ def search_tickets(
 
     Pinecone handles content-level recall when the ticket vector index is
     configured. SQL keyword search remains the zero-dependency local fallback.
+    When query is None or empty, returns the most recent tickets matching filters.
     """
     if not query or not query.strip():
-        return []
+        # No search query — return most recent tickets matching filters.
+        stmt = (
+            select(TicketRecord)
+            .options(*_ticket_read_options())
+            .order_by(TicketRecord.created_at.desc())
+            .limit(limit)
+        )
+        if user_id:
+            stmt = stmt.where(TicketRecord.user_id == user_id)
+        if project_id is not None:
+            stmt = stmt.where(TicketRecord.project_id == project_id)
+        if status:
+            stmt = stmt.where(TicketRecord.status == status)
+        if priority:
+            stmt = stmt.where(TicketRecord.suggested_priority == priority)
+        if tag_slugs:
+            stmt = (
+                stmt.join(TicketTagRecord, TicketTagRecord.ticket_id == TicketRecord.id)
+                .join(TagRecord, TagRecord.id == TicketTagRecord.tag_id)
+                .where(TagRecord.slug.in_(tag_slugs))
+            )
+        return [
+            {
+                "ticket_id": record.id,
+                "summary": record.summary,
+                "status": record.status,
+                "priority": record.suggested_priority,
+                "category": record.category,
+                "app_name": record.app_name,
+                "user_id": record.user_id,
+                "project_id": record.project_id,
+                "tags": _tag_slugs_for_record(record),
+                "created_at": (
+                    record.created_at.isoformat() if record.created_at else None
+                ),
+                "score": 0,
+                "source": "recent",
+            }
+            for record in db.scalars(stmt).unique().all()
+        ]
 
     vector_results = (
         _search_ticket_vectors(
