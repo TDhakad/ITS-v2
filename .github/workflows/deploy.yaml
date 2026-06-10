@@ -62,8 +62,7 @@ jobs:
         uses: 'google-github-actions/auth@f112390a2df9932162083945e46d439060d66ec2' # google-github-actions/auth@v2
         with:
           workload_identity_provider: '${{ env.WORKLOAD_IDENTITY_PROVIDER }}'
-          service_account: its-cloud-run@intelligent-ticketing-system.iam.gserviceaccount.com
-          token_format: access_token
+          service_account: its-cloud-run@mythic-method-499001-g3.iam.gserviceaccount.com
 
       # BEGIN - Docker auth and build
       #
